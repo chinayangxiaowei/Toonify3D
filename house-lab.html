@@ -45,6 +45,8 @@
     background:rgba(255,255,255,.85);border:1px solid rgba(64,48,44,.28);
     border-radius:6px;padding:3px 8px;cursor:pointer}
   #hud button:hover{background:#fff}
+  #atlas-pick{width:96px;height:96px;border:1px solid rgba(64,48,44,.28);border-radius:6px;
+    background:#fff;cursor:pointer;display:block}
   #err{position:fixed;left:14px;top:14px;z-index:20;max-width:64ch;display:none;white-space:pre-wrap;
     background:#fff4f1;border:1px solid #d98b7a;border-radius:8px;padding:8px 11px;font-size:12px}
 </style>
@@ -74,6 +76,11 @@
     <label class="sl">配色 <select id="s-scheme"></select></label>
     <button id="btn-random" type="button">随机和声</button>
     <span class="dim">整体沿色相环旋转，物体之间的相对色相不变 → 换哪个都还协调</span>
+  </div>
+  <div class="row">
+    <label class="sl">肌理格 <select id="s-atlas-cell"></select></label>
+    <canvas id="atlas-pick" width="144" height="144" title="点格子直接选"></canvas>
+    <span class="dim">缩略图就是 gouache-atlas.png（3×3，横/纵读数）。<br>选「自动」时按材质本色分配：绿=草地、砖红=屋瓦、棕=木纹、浅色=壁板</span>
   </div>
 </div>
 
@@ -121,6 +128,7 @@ const P = {
   grainOn: true,
   atlas:   0.520,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
   atlasScale: 0.55, // 肌理取样尺度（格/世界米）
+  atlasCell: -1,    // 手动指定用哪一格（0~8）；-1 = 按材质本色自动分配
   outline: true,
   perturb: true     // C 键：整体关掉扰动，用来对比
 };
@@ -375,6 +383,37 @@ function atlasCellFor(mat) {
   return 0;                                                     // 默认：壁板（横纹，最有"手绘墙"感）
 }
 
+// 每个材质拿一份自己的肌理格容器（不直接共用 atlasU，才能手动换格）
+const atlasMats = [];
+function makeAtlasSlot() {
+  return { tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) } };
+}
+// idx = -1 → 按材质本色自动；0~8 → 全场统一用那一格
+function setAtlasCell(idx) {
+  P.atlasCell = idx;
+  atlasMats.forEach(function (e) {
+    const c = (idx < 0) ? e.auto : idx;
+    e.slot.tex.value = atlasU[c].tex.value;
+    e.slot.mean.value.copy(atlasU[c].mean.value);
+  });
+  needsDraw = true;
+}
+// 把 9 格画进选择器（缩略图就是图集本身，点了就知道是哪一格）
+function paintAtlasPicker(img) {
+  const el = document.getElementById('atlas-pick');
+  if (!el) return;
+  const S = el.width, T = S / ATLAS_N;
+  const x = el.getContext('2d');
+  x.clearRect(0, 0, S, S);
+  x.drawImage(img, 0, 0, img.width, img.height, 0, 0, S, S);
+  x.strokeStyle = 'rgba(64,48,44,.35)';
+  x.lineWidth = 1;
+  for (let k = 1; k < ATLAS_N; k++) {
+    x.beginPath(); x.moveTo(k * T + 0.5, 0); x.lineTo(k * T + 0.5, S); x.stroke();
+    x.beginPath(); x.moveTo(0, k * T + 0.5); x.lineTo(S, k * T + 0.5); x.stroke();
+  }
+}
+
 (function loadAtlas() {
   const img = new Image();
   img.onload = function () {
@@ -402,6 +441,8 @@ function atlasCellFor(mat) {
           Math.max(0.02, sr / n), Math.max(0.02, sg / n), Math.max(0.02, sb / n));   // 防除零
       }
     }
+    setAtlasCell(P.atlasCell);          // 把格子发给所有材质
+    paintAtlasPicker(img);              // 顺手把 9 格画进选择器
     uPrAtlasK.value = P.perturb ? P.atlas : 0;
     needsDraw = true;
   };
@@ -442,15 +483,16 @@ const PIGMENT_MIX = `
 function toon(color, extra) {
   const m = new THREE.MeshToonMaterial(Object.assign({ color: color, gradientMap: gradientMap }, extra || {}));
   registerTint(m);
-  const cell = atlasU[atlasCellFor(m)];
+  const slot = makeAtlasSlot();
+  atlasMats.push({ slot: slot, auto: atlasCellFor(m) });
   m.onBeforeCompile = function (shader) {
     shader.uniforms.gradientMap = { value: gradientMap };
     shader.uniforms.uBodyAmp = U.uBodyAmp;
     shader.uniforms.uLowAmp  = U.uLowAmp;
     shader.uniforms.uHighAmp = U.uHighAmp;
     shader.uniforms.uInk     = U.uInk;
-    shader.uniforms.uPrAtlas      = cell.tex;      // 共享引用：图集加载完自动生效
-    shader.uniforms.uPrAtlasMean  = cell.mean;
+    shader.uniforms.uPrAtlas      = slot.tex;      // 每材质一份容器：换格立刻生效
+    shader.uniforms.uPrAtlasMean  = slot.mean;
     shader.uniforms.uPrAtlasK     = uPrAtlasK;
     shader.uniforms.uPrAtlasScale = uPrAtlasScale;
     shader.vertexShader = shader.vertexShader
@@ -858,6 +900,34 @@ bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.pe
 bind('s-grain', 'o-grain', 'grain');
 bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.perturb ? v : 0; });
 
+// 肌理格：下拉 + 9 格缩略图（点图直接选）
+const ATLAS_NAMES = ['0 · 壁板（横纹）', '1 · 木纹（竖纹）', '2 · 素纹 A', '3 · 素纹 B',
+                     '4 · 屋瓦（行纹）', '5 · 草地（高频）', '6 · 素纹 C', '7 · 灰泥（最平滑）', '8 · 素纹 D'];
+(function () {
+  const sel = document.getElementById('s-atlas-cell');
+  const oa = document.createElement('option');
+  oa.value = '-1'; oa.textContent = '自动（按材质本色）';
+  sel.appendChild(oa);
+  for (let i = 0; i < ATLAS_N * ATLAS_N; i++) {
+    const o = document.createElement('option');
+    o.value = String(i); o.textContent = ATLAS_NAMES[i];
+    sel.appendChild(o);
+  }
+  sel.value = String(P.atlasCell);
+  sel.addEventListener('change', function () { setAtlasCell(parseInt(sel.value, 10)); });
+
+  const pk = document.getElementById('atlas-pick');
+  pk.addEventListener('click', function (e) {
+    const r = pk.getBoundingClientRect();
+    const col = Math.floor((e.clientX - r.left) / (r.width / ATLAS_N));
+    const row = Math.floor((e.clientY - r.top) / (r.height / ATLAS_N));
+    if (col < 0 || col >= ATLAS_N || row < 0 || row >= ATLAS_N) return;
+    const idx = row * ATLAS_N + col;
+    sel.value = String(idx);
+    setAtlasCell(idx);
+  });
+})();
+
 function setOutline(on) {
   P.outline = on;
   outlineMeshes.forEach(function (m) { m.visible = on; });
@@ -961,6 +1031,7 @@ window.__lab.setView = function (t, p, r) {
 window.__lab.setScheme = function (name) { applyScheme(name); return true; };
 window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return true; };
 window.__lab.tintCount = function () { return tintList.length; };
+window.__lab.setAtlasCell = function (i) { setAtlasCell(i); return P.atlasCell; };
 window.__lab.atlasInfo = function () {
   return {
     loaded: atlasU.filter(function (u) { return !!u.tex.value; }).length,
