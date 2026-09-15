@@ -68,6 +68,7 @@
     <label class="sl">交界印痕 <input id="s-ink" type="range" min="0" max="0.50" step="0.005"><output id="o-ink"></output></label>
     <label class="sl">勾线起毛 <input id="s-wobble" type="range" min="0" max="3" step="0.05"><output id="o-wobble"></output></label>
     <label class="sl">纸纹 <input id="s-grain" type="range" min="0" max="0.70" step="0.01"><output id="o-grain"></output></label>
+    <label class="sl">水粉肌理 <input id="s-atlas" type="range" min="0" max="1" step="0.01"><output id="o-atlas"></output></label>
   </div>
   <div class="row">
     <label class="sl">配色 <select id="s-scheme"></select></label>
@@ -118,6 +119,8 @@ const P = {
   wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
   grain:   0.280,   // 纸纹强度
   grainOn: true,
+  atlas:   0.520,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
+  atlasScale: 0.55, // 肌理取样尺度（格/世界米）
   outline: true,
   perturb: true     // C 键：整体关掉扰动，用来对比
 };
@@ -220,6 +223,10 @@ gradientMap.needsUpdate = true;
 
 const GRADIENT_PARS = `
   uniform sampler2D gradientMap;
+  uniform sampler2D uPrAtlas;      // 手绘水粉图集里"本面"那一格
+  uniform vec3  uPrAtlasMean;      // 该格在 linear 空间的每通道均值：除它，肌理只贡献起伏、不改整体明暗
+  uniform float uPrAtlasK;         // 肌理强度
+  uniform float uPrAtlasScale;     // 取样尺度（格/米）
   uniform float uBodyAmp;
   uniform float uLowAmp;
   uniform float uHighAmp;
@@ -326,6 +333,82 @@ const GRADIENT_PARS = `
   }
 `;
 
+// 手绘水粉肌理：世界坐标盒式投影采样图集，乘进漫反射。
+// 图集是真人画的中性灰白水粉 → 乘到底色上只加"手绘厚薄"，不会带进异色。
+const ATLAS_MIX = `
+  #include <map_fragment>
+  if ( uPrAtlasK > 0.001 ) {
+    vec3 an = abs( vNormal );                       // 按法线主轴选投影面
+    vec2 auv;
+    if ( an.x >= an.y && an.x >= an.z )      auv = vec2( vPrPos.z, vPrPos.y );
+    else if ( an.y >= an.z )                 auv = vec2( vPrPos.x, vPrPos.z );
+    else                                     auv = vec2( vPrPos.x, vPrPos.y );
+    auv *= uPrAtlasScale;
+    vec3 gouache = texture2D( uPrAtlas, auv ).rgb / max( vec3( 0.02 ), uPrAtlasMean );
+    diffuseColor.rgb *= mix( vec3( 1.0 ), gouache, uPrAtlasK );
+  }
+`;
+
+// ─────────────────────── 水粉肌理图集 gouache-atlas.png ───────────────────────
+// 3×3 格，切成 9 张独立纹理（各自 mipmap，远处不会串格）。每格算均值亮度，
+// shader 里除掉 → 肌理只贡献起伏，不会把物体整体压暗。
+const ATLAS_N = 3;
+const ATLAS_PX = 512;                 // 重采样到 2 的幂，mipmap 才稳
+const PR_SRGB2LIN = new Float32Array(256);
+for (let i = 0; i < 256; i++) PR_SRGB2LIN[i] = Math.pow(i / 255, 2.2);
+const atlasU = [];                    // 每格 { tex:{value}, mean:{value} }，材质共享引用
+for (let i = 0; i < ATLAS_N * ATLAS_N; i++) atlasU.push({ tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) } });
+const uPrAtlasK     = { value: 0 };   // 先关着，图集加载完再打开（免得采样到未绑定的纹理）
+const uPrAtlasScale = { value: P.atlasScale };
+
+// 按材质本色挑一格。格子身份是从图集里量出来的方向性猜的：
+//   0 r0c0 强横纹(2.5) → 壁板    1 r0c1 强竖纹(0.31) → 木板    2 r0c2 各向同性
+//   3 r1c0 中等       4 r1c1 行纹 → 屋瓦    5 r1c2 高频最强 → 草地
+//   6 r2c0 中等       7 r2c1 最平滑 → 灰泥    8 r2c2 中等
+function atlasCellFor(mat) {
+  const hsl = { h: 0, s: 0, l: 0 };
+  mat.color.getHSL(hsl, THREE.SRGBColorSpace);
+  const h = hsl.h, s = hsl.s, l = hsl.l;
+  if (s > 0.25 && h > 0.17 && h < 0.47) return 5;               // 绿 → 草地
+  if (s > 0.28 && (h < 0.055 || h > 0.94)) return 4;            // 红 / 砖 → 屋瓦
+  if (s > 0.12 && h >= 0.035 && h < 0.14 && l < 0.62) return 1; // 棕木 → 木纹
+  return 0;                                                     // 默认：壁板（横纹，最有"手绘墙"感）
+}
+
+(function loadAtlas() {
+  const img = new Image();
+  img.onload = function () {
+    const cw = img.width / ATLAS_N, ch = img.height / ATLAS_N;
+    for (let row = 0; row < ATLAS_N; row++) {
+      for (let col = 0; col < ATLAS_N; col++) {
+        const c = document.createElement('canvas');
+        c.width = c.height = ATLAS_PX;
+        const x = c.getContext('2d');
+        x.drawImage(img, col * cw, row * ch, cw, ch, 0, 0, ATLAS_PX, ATLAS_PX);
+        const d = x.getImageData(0, 0, ATLAS_PX, ATLAS_PX).data;
+        // 均值必须在 **linear 空间**算：纹理会做 sRGB→linear 解码，
+        // 在 sRGB 上求的均值对不上，结果就是整片被压暗（暗部还会增多）。
+        let sr = 0, sg = 0, sb = 0, n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sr += PR_SRGB2LIN[d[i]]; sg += PR_SRGB2LIN[d[i + 1]]; sb += PR_SRGB2LIN[d[i + 2]]; n++;
+        }
+        const t = new THREE.CanvasTexture(c);
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.anisotropy = 4;
+        t.needsUpdate = true;
+        atlasU[row * ATLAS_N + col].tex.value = t;
+        atlasU[row * ATLAS_N + col].mean.value.set(
+          Math.max(0.02, sr / n), Math.max(0.02, sg / n), Math.max(0.02, sb / n));   // 防除零
+      }
+    }
+    uPrAtlasK.value = P.perturb ? P.atlas : 0;
+    needsDraw = true;
+  };
+  img.onerror = function () { window.__lab.errors.push('gouache-atlas.png 没加载到'); };
+  img.src = 'gouache-atlas.png';
+})();
+
 // 参与整体配色的材质清单：记下每个材质的原始 HSL，配色时统一旋转色相 / 调饱和度明度，
 // 物体之间的相对关系保持不变 —— 所以转到哪个色相都还是协调的。
 const tintList = [];
@@ -359,12 +442,17 @@ const PIGMENT_MIX = `
 function toon(color, extra) {
   const m = new THREE.MeshToonMaterial(Object.assign({ color: color, gradientMap: gradientMap }, extra || {}));
   registerTint(m);
+  const cell = atlasU[atlasCellFor(m)];
   m.onBeforeCompile = function (shader) {
     shader.uniforms.gradientMap = { value: gradientMap };
     shader.uniforms.uBodyAmp = U.uBodyAmp;
     shader.uniforms.uLowAmp  = U.uLowAmp;
     shader.uniforms.uHighAmp = U.uHighAmp;
     shader.uniforms.uInk     = U.uInk;
+    shader.uniforms.uPrAtlas      = cell.tex;      // 共享引用：图集加载完自动生效
+    shader.uniforms.uPrAtlasMean  = cell.mean;
+    shader.uniforms.uPrAtlasK     = uPrAtlasK;
+    shader.uniforms.uPrAtlasScale = uPrAtlasScale;
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vPrPos;\nvarying float vPrDist;')
       .replace('#include <begin_vertex>', [
@@ -375,6 +463,7 @@ function toon(color, extra) {
       ].join('\n'));
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <gradientmap_pars_fragment>', GRADIENT_PARS)
+      .replace('#include <map_fragment>', ATLAS_MIX)
       .replace('#include <opaque_fragment>', PIGMENT_MIX);
   };
   return m;
@@ -767,6 +856,7 @@ bind('s-high', 'o-high', 'highAmp', function (v) { U.uHighAmp.value = P.perturb 
 bind('s-ink',  'o-ink',  'ink',     function (v) { U.uInk.value     = P.perturb ? v : 0; });
 bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.perturb ? v : 0; });
 bind('s-grain', 'o-grain', 'grain');
+bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.perturb ? v : 0; });
 
 function setOutline(on) {
   P.outline = on;
@@ -780,6 +870,7 @@ function setPerturb(on) {
   U.uHighAmp.value = on ? P.highAmp : 0;
   U.uInk.value     = on ? P.ink : 0;
   U.uOutlineWob.value = on ? P.wobble : 0;
+  uPrAtlasK.value  = on ? P.atlas : 0;
   needsDraw = true;
 }
 function setGrain(on) { P.grainOn = on; needsDraw = true; }
@@ -841,13 +932,14 @@ window.addEventListener('keydown', function (e) {
 // ─────────────────────────── 调试口（给 agent 采样用） ───────────────────────────
 window.__lab.setParam = function (k, v) {
   P[k] = v;
-  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain' }[k]);
+  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain', atlas: 'atlas' }[k]);
   if (el) { el.value = String(v); }
   if (k === 'bodyAmp') U.uBodyAmp.value = v;
   if (k === 'wobble') U.uOutlineWob.value = v;
   if (k === 'lowAmp') U.uLowAmp.value = v;
   if (k === 'highAmp') U.uHighAmp.value = v;
   if (k === 'ink') U.uInk.value = v;
+  if (k === 'atlas') uPrAtlasK.value = v;
   needsDraw = true;
 };
 window.__lab.sample = function (x, y) {
@@ -869,6 +961,17 @@ window.__lab.setView = function (t, p, r) {
 window.__lab.setScheme = function (name) { applyScheme(name); return true; };
 window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return true; };
 window.__lab.tintCount = function () { return tintList.length; };
+window.__lab.atlasInfo = function () {
+  return {
+    loaded: atlasU.filter(function (u) { return !!u.tex.value; }).length,
+    means: atlasU.map(function (u) {
+      const m = u.mean.value;
+      return [+m.x.toFixed(3), +m.y.toFixed(3), +m.z.toFixed(3)];
+    }),
+    k: uPrAtlasK.value,
+    scale: uPrAtlasScale.value
+  };
+};
 window.__lab.patch = function (x, y, w, h) {
   const d = pctx.getImageData(Math.round(x), Math.round(y), Math.round(w), Math.round(h)).data;
   let r = 0, g = 0, b = 0, n = 0, min = 255, max = 0;
@@ -896,3 +999,7 @@ window.__lab.ready = true;
 </script>
 </body>
 </html>
+cript>
+</body>
+</html>
+l>
