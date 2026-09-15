@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>paperroute · 画风试验台（最小房子）</title>
+<!--
+  paperroute 画风试验台 — 最小房子 demo
+  ---------------------------------------------------------------
+  这台机器的坑（别忘）：
+   1) webview 截图抓不到 WebGL 图层，所以每帧把 WebGL canvas drawImage 到一张 2D canvas 上中转，
+      截图/肉眼看到的是那张 2D canvas。纸纹后处理也顺手叠在它上面。
+   2) 别每帧做逐像素的全屏软光填充（吃满主线程会卡死）。颗粒用预生成的 tile + pattern 一次 fillRect。
+   3) 关键画风手法：MeshToonMaterial.onBeforeCompile 里替掉 #include <gradientmap_pars_fragment>，
+      自己实现 getGradientIrradiance，量化前用两张不同尺度的噪声扰动 coord.x：
+        /380 低频（大振幅）→ 整片颜色厚薄不匀
+        /72  高频（小振幅）→ 色块交界起毛边
+      另加一层"交界印痕"：在档位边界处把 irradiance 轻轻压深一点，像颜料堆积的笔痕。
+   4) 描边：同几何体 BackSide 复制、按物体尺寸 scale 1.02~1.09，色深褐 0x40302c，不用纯黑。
+-->
+<style>
+  :root{ --ink:#40302c; }
+  html,body{margin:0;height:100%;overflow:hidden;background:#dcecf5;
+    font:13px/1.5 -apple-system,"PingFang SC","Hiragino Sans GB",sans-serif;color:var(--ink)}
+  #stack{position:fixed;inset:0}
+  canvas{position:absolute;inset:0;display:block;width:100%;height:100%}
+  #gl{z-index:1}
+  #paper{z-index:2;cursor:grab}
+  #paper.drag{cursor:grabbing}
+  #hud{position:fixed;left:14px;bottom:14px;z-index:10;max-width:calc(100% - 28px);
+    background:rgba(255,255,255,.74);border:1px solid rgba(64,48,44,.16);border-radius:10px;
+    padding:9px 12px 10px;backdrop-filter:blur(6px);box-shadow:0 2px 10px rgba(64,48,44,.08)}
+  #hud .row{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  #hud .row+.row{margin-top:7px}
+  #hud b{font-weight:650;letter-spacing:.02em}
+  #hud .dim{opacity:.62}
+  kbd{border:1px solid rgba(64,48,44,.28);border-bottom-width:2px;border-radius:4px;
+    padding:0 4px;font:11px/1.6 ui-monospace,monospace;background:rgba(255,255,255,.6)}
+  label.sl{display:flex;align-items:center;gap:6px;white-space:nowrap}
+  label.sl input[type=range]{width:104px;accent-color:#7a9a5b;height:16px}
+  label.sl output{font:11px/1 ui-monospace,monospace;opacity:.7;width:44px;text-align:right}
+  label.ck{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+  label.ck input{accent-color:#7a9a5b}
+  #hud select, #hud button{font:12px/1.4 inherit;color:var(--ink);
+    background:rgba(255,255,255,.85);border:1px solid rgba(64,48,44,.28);
+    border-radius:6px;padding:3px 8px;cursor:pointer}
+  #hud button:hover{background:#fff}
+  #err{position:fixed;left:14px;top:14px;z-index:20;max-width:64ch;display:none;white-space:pre-wrap;
+    background:#fff4f1;border:1px solid #d98b7a;border-radius:8px;padding:8px 11px;font-size:12px}
+</style>
+</head>
+<body>
+<div id="stack">
+  <canvas id="gl"></canvas>
+  <canvas id="paper"></canvas>
+</div>
+
+<div id="hud">
+  <div class="row">
+    <b>paperroute</b><span class="dim">画风试验台</span>
+    <span class="dim">拖拽旋转 · 滚轮缩放 ·</span>
+    <span class="dim"><kbd>R</kbd>复位 <kbd>C</kbd>对比(关扰动) <kbd>P</kbd>纸纹 <kbd>O</kbd>描边</span>
+  </div>
+  <div class="row">
+    <label class="sl">颜料厚薄 <input id="s-body" type="range" min="0" max="1.20" step="0.01"><output id="o-body"></output></label>
+    <label class="sl">色块抖动 <input id="s-low" type="range" min="0" max="0.40" step="0.005"><output id="o-low"></output></label>
+    <label class="sl">交界起毛 <input id="s-high" type="range" min="0" max="0.30" step="0.005"><output id="o-high"></output></label>
+    <label class="sl">交界印痕 <input id="s-ink" type="range" min="0" max="0.50" step="0.005"><output id="o-ink"></output></label>
+    <label class="sl">勾线起毛 <input id="s-wobble" type="range" min="0" max="3" step="0.05"><output id="o-wobble"></output></label>
+    <label class="sl">纸纹 <input id="s-grain" type="range" min="0" max="0.70" step="0.01"><output id="o-grain"></output></label>
+  </div>
+  <div class="row">
+    <label class="sl">配色 <select id="s-scheme"></select></label>
+    <button id="btn-random" type="button">随机和声</button>
+    <span class="dim">整体沿色相环旋转，物体之间的相对色相不变 → 换哪个都还协调</span>
+  </div>
+</div>
+
+<div id="err"></div>
+
+<script>
+  // 兜底：即使 module 没跑起来也能报告
+  window.__lab = { ready:false, errors:[], three:'?' };
+  window.addEventListener('error', function(e){
+    window.__lab.errors.push(String(e.message||e.error||e));
+    var el = document.getElementById('err');
+    el.style.display = 'block';
+    el.textContent = '出错了：\n' + window.__lab.errors.join('\n');
+  });
+  setTimeout(function(){
+    if (!window.__lab.ready) {
+      var el = document.getElementById('err');
+      el.style.display = 'block';
+      el.textContent = '3 秒了还没初始化完：three.module.js 大概没从 unpkg 拿下来（网络/CDN 问题），'
+        + '或者 WebGL 起不来。';
+    }
+  }, 3000);
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+window.__lab.three = THREE.REVISION;
+
+// ─────────────────────────── 可调参数 ───────────────────────────
+const P = {
+  bodyAmp: 0.350,   // 色块内部的厚薄起伏（连续项，不过量化）—— 治"太干净"的主力
+  lowAmp:  0.200,   // 档位偏移：整片色块边界的位置一起抖动
+  highAmp: 0.100,   // 高频：色块交界起毛边（细碎毛刺）
+  ink:     0.180,   // 交界处的淡淡压深（画笔印痕 / 颜料堆积）
+  wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
+  grain:   0.280,   // 纸纹强度
+  grainOn: true,
+  outline: true,
+  perturb: true     // C 键：整体关掉扰动，用来对比
+};
+// uniform 对象共享 → 拖滑块立刻生效，不用重编译
+const U = {
+  uBodyAmp: { value: P.bodyAmp },
+  uLowAmp:  { value: P.lowAmp },
+  uHighAmp: { value: P.highAmp },
+  uInk:     { value: P.ink },
+  uOutlineWob: { value: P.wobble }
+};
+let needsDraw = true;   // 脏标记：只有相机 / 参数 / 尺寸变化才重画合成
+
+// ─────────────────────────── 渲染器 / 场景 ───────────────────────────
+const glCanvas = document.getElementById('gl');
+const paper    = document.getElementById('paper');
+const pctx     = paper.getContext('2d');
+
+const renderer = new THREE.WebGLRenderer({
+  canvas: glCanvas, antialias: true, preserveDrawingBuffer: true // 中转 drawImage 需要它
+});
+renderer.setClearColor(0xdcecf5, 1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xdfeef6, 30, 120);
+
+const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 500);
+
+// ─────────────────────────── 天空（颜色跟着整体配色走） ───────────────────────────
+const SKY_STOPS = [
+  [0.00, 0x4c9ada],   // 天顶：饱和的蓝
+  [0.42, 0x8dc6e8],
+  [0.66, 0xd6eaf3],
+  [0.80, 0xf2f1e6],   // 地平线附近泛暖白
+  [1.00, 0xe8eddf]
+];
+const skyCanvas = document.createElement('canvas');
+skyCanvas.width = 8; skyCanvas.height = 320;
+
+function paintSky(hs, sm, lm) {
+  hs = hs || 0; sm = (sm === undefined ? 1 : sm); lm = (lm === undefined ? 1 : lm);
+  const x = skyCanvas.getContext('2d');
+  const g = x.createLinearGradient(0, 0, 0, 320);
+  const tmp = new THREE.Color(), hsl = { h: 0, s: 0, l: 0 };
+  SKY_STOPS.forEach(function (st) {
+    tmp.setHex(st[1]);
+    tmp.getHSL(hsl, THREE.SRGBColorSpace);
+    tmp.setHSL((hsl.h + hs + 1) % 1, Math.min(1, hsl.s * sm), Math.min(1, hsl.l * lm), THREE.SRGBColorSpace);
+    g.addColorStop(st[0], '#' + tmp.getHexString());
+  });
+  x.fillStyle = g; x.fillRect(0, 0, 8, 320);
+  if (typeof skyTex !== 'undefined' && skyTex) skyTex.needsUpdate = true;
+}
+
+const skyTex = new THREE.CanvasTexture(skyCanvas);
+skyTex.colorSpace = THREE.SRGBColorSpace;
+paintSky(0, 1, 1);
+
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(160, 32, 24),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false, depthWrite: false })
+);
+sky.renderOrder = -1;
+scene.add(sky);
+
+// ─────────────────────────── 光照 ───────────────────────────
+const SUN_BASE = new THREE.Color(0xfff3dd);
+const AMB_BASE = new THREE.Color(0xd6e6f2);
+const FILL_BASE = new THREE.Color(0xc6dcee);
+const FOG_BASE = new THREE.Color(0xdfeef6);
+
+const sun = new THREE.DirectionalLight(SUN_BASE.getHex(), 1.35);
+sun.position.set(7.5, 11, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 45;
+sun.shadow.camera.left = -14; sun.shadow.camera.right = 14;
+sun.shadow.camera.top = 14;   sun.shadow.camera.bottom = -14;
+sun.shadow.bias = -0.0009;
+sun.shadow.normalBias = 0.02;
+scene.add(sun);
+const amb = new THREE.AmbientLight(AMB_BASE.getHex(), 0.42);
+scene.add(amb);
+const fill = new THREE.DirectionalLight(FILL_BASE.getHex(), 0.22);
+fill.position.set(-6, 4, -7);
+scene.add(fill);
+
+// ─────────────────────────── toon 材质 + 画风补丁 ───────────────────────────
+const INK = 0x40302c;
+const gradData = new Uint8Array([96, 158, 212, 255]);   // 4 档量化
+const gradientMap = new THREE.DataTexture(gradData, gradData.length, 1, THREE.RedFormat);
+gradientMap.minFilter = THREE.NearestFilter;
+gradientMap.magFilter = THREE.NearestFilter;
+gradientMap.generateMipmaps = false;
+gradientMap.needsUpdate = true;
+
+const GRADIENT_PARS = `
+  uniform sampler2D gradientMap;
+  uniform float uBodyAmp;
+  uniform float uLowAmp;
+  uniform float uHighAmp;
+  uniform float uInk;
+
+  varying vec3  vPrPos;    // 世界坐标：噪声钉在世界/物体上，相机转动/缩放时纹理跟着物体走
+  varying float vPrDist;   // 到相机的距离：远处把高频淡出，免得亚像素闪烁
+  float gPrThick = 0.5;    // 浓淡权重（0=薄透，1=浓重）；由 getGradientIrradiance 写入，main 里读
+
+  // 频率单位 = 1/世界单位（相机距离 9 时，屏幕上 1 世界单位 ≈ 234 设备像素）
+  #define PR_BODY_A 1.05                     // 面级厚薄
+  #define PR_BODY_B 3.30                     // 局部块状起伏
+  #define PR_BODY_C vec3(8.30, 23.0, 8.30)   // 细笔触：y 方向频率高 → 横向短笔
+  #define PR_LOW_SCALE  1.54                 // 整片色块边界一起抖动
+  #define PR_HIGH_SCALE 10.60                // 交界处的细碎毛边
+
+  float prHash3(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123); }
+  float prNoise3(vec3 p){
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = prHash3(i);
+    float n100 = prHash3(i + vec3(1.0, 0.0, 0.0));
+    float n010 = prHash3(i + vec3(0.0, 1.0, 0.0));
+    float n110 = prHash3(i + vec3(1.0, 1.0, 0.0));
+    float n001 = prHash3(i + vec3(0.0, 0.0, 1.0));
+    float n101 = prHash3(i + vec3(1.0, 0.0, 1.0));
+    float n011 = prHash3(i + vec3(0.0, 1.0, 1.0));
+    float n111 = prHash3(i + vec3(1.0, 1.0, 1.0));
+    float nx00 = mix(n000, n100, f.x), nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x), nx11 = mix(n011, n111, f.x);
+    return mix( mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z );
+  }
+
+  vec3 getGradientIrradiance( vec3 normal, vec3 lightDirection ) {
+    float dotNL = dot( normal, lightDirection );
+    vec2 coord = vec2( dotNL * 0.5 + 0.5, 0.0 );
+    float atten = 1.0 / ( 1.0 + vPrDist * vPrDist * 0.0022 );   // 远处高频淡出
+
+    float nBodyA = prNoise3( vPrPos * PR_BODY_A + 3.1 );
+    float nBodyB = prNoise3( vPrPos * PR_BODY_B + 11.3 );
+    float nBodyC = prNoise3( vPrPos * PR_BODY_C + 27.7 );
+    float nLow   = prNoise3( vPrPos * PR_LOW_SCALE  );
+    float nHigh  = prNoise3( vPrPos * PR_HIGH_SCALE );
+
+    // ① 量化之前推一下 coord.x：色块边界跟着抖，交界处起毛
+    coord.x += ( nLow  - 0.5 ) * uLowAmp * 2.0
+             + ( nHigh - 0.5 ) * uHighAmp * 2.0 * ( 0.45 + 0.55 * atten );
+
+    // ② 交界那一线压深：颜料堆积的笔痕。**按比例压**，不要减一个绝对值 ——
+    //    暗面 g 本来就小，减绝对值等于减半，那就是一条黑线。
+    float tq = coord.x * 4.0;
+    float dEdge = abs( tq - floor( tq + 0.5 ) );
+    float ink = uInk * pow( max( 0.0, 1.0 - dEdge * 3.2 ), 2.0 );
+
+    float g = texture2D( gradientMap, coord ).r;
+
+    // ③ 色块内部的"颜料厚薄"：要表现成 **颜色的变化**（薄处冷浅、厚处暖浓），
+    //    而不是明暗斑块 —— 后者在暗面就是一坨黑。
+    float body = ( nBodyA - 0.5 ) * uBodyAmp * 0.75
+               + ( nBodyB - 0.5 ) * uBodyAmp
+               + ( nBodyC - 0.5 ) * uBodyAmp * 0.45 * atten;
+    body = clamp( body, -0.55, 0.65 );
+
+    // "画笔交替"的浓淡权重。颜色**不在这里决定** —— 交给 main 按"物体本色"派生，
+    // 这样纹理永远是同色系的浓淡，而不是往底色上叠一个异色（异色乘底色 = 发脏发黑）。
+    gPrThick = clamp( body * 0.5 + 0.5, 0.0, 1.0 );
+
+    return vec3( max( 0.0, g * ( 1.0 - ink ) ) );
+  }
+
+  // ── 颜色工具：在 HSL 空间里派生"同色相"的浓淡色 ──
+  // 在 RGB 空间缩放饱和度会让色相跟着漂（绿会偏黄偏褐），所以必须走 HSL。
+  vec3 prLin2Srgb( vec3 c ){ return pow( max( c, vec3( 0.0 ) ), vec3( 1.0 / 2.2 ) ); }
+  vec3 prSrgb2Lin( vec3 c ){ return pow( max( c, vec3( 0.0 ) ), vec3( 2.2 ) ); }
+  float prHue2rgb( float p, float q, float t ) {
+    if ( t < 0.0 ) t += 1.0;
+    if ( t > 1.0 ) t -= 1.0;
+    if ( t < 1.0 / 6.0 ) return p + ( q - p ) * 6.0 * t;
+    if ( t < 1.0 / 2.0 ) return q;
+    if ( t < 2.0 / 3.0 ) return p + ( q - p ) * ( 2.0 / 3.0 - t ) * 6.0;
+    return p;
+  }
+  vec3 prRgb2Hsl( vec3 c ) {
+    float mx = max( max( c.r, c.g ), c.b );
+    float mn = min( min( c.r, c.g ), c.b );
+    float l = ( mx + mn ) * 0.5;
+    float d = mx - mn;
+    float h = 0.0, s = 0.0;
+    if ( d > 0.00001 ) {
+      s = l > 0.5 ? d / max( 0.0001, 2.0 - mx - mn ) : d / max( 0.0001, mx + mn );
+      if ( mx == c.r )      h = ( c.g - c.b ) / d + ( c.g < c.b ? 6.0 : 0.0 );
+      else if ( mx == c.g ) h = ( c.b - c.r ) / d + 2.0;
+      else                  h = ( c.r - c.g ) / d + 4.0;
+      h /= 6.0;
+    }
+    return vec3( h, s, l );
+  }
+  vec3 prHsl2Rgb( vec3 hsl ) {
+    float h = hsl.x, s = hsl.y, l = hsl.z;
+    if ( s < 0.00001 ) return vec3( l );
+    float q = l < 0.5 ? l * ( 1.0 + s ) : l + s - l * s;
+    float p = 2.0 * l - q;
+    return vec3( prHue2rgb( p, q, h + 1.0 / 3.0 ), prHue2rgb( p, q, h ), prHue2rgb( p, q, h - 1.0 / 3.0 ) );
+  }
+`;
+
+// 参与整体配色的材质清单：记下每个材质的原始 HSL，配色时统一旋转色相 / 调饱和度明度，
+// 物体之间的相对关系保持不变 —— 所以转到哪个色相都还是协调的。
+const tintList = [];
+function registerTint(mat) {
+  const hsl = { h: 0, s: 0, l: 0 };
+  mat.color.getHSL(hsl, THREE.SRGBColorSpace);
+  tintList.push({ mat: mat, h: hsl.h, s: hsl.s, l: hsl.l });
+  return mat;
+}
+
+// 画笔交替：**取本面当前的色**，在 HSL 空间派生"重色 / 薄色"。
+// 色相严格不动，只改饱和度与明度 → 纹理永远是同一个颜色的浓淡，不会跑色、不会发脏。
+// 两色对称：S 的 1.14/0.86、L 的 0.92/1.08 平均都是 1.0，所以权重 0.5 时就是本色。
+const PIGMENT_MIX = `
+  #include <opaque_fragment>
+  {
+    float w = clamp( gPrThick, 0.0, 1.0 );
+
+    vec3 hsl = prRgb2Hsl( prLin2Srgb( gl_FragColor.rgb ) );
+
+    // 重色：同色相，饱和度 +14%、明度 −8%（像同一支颜料压得更实）
+    vec3 heavy = vec3( hsl.x, clamp( hsl.y * 1.14, 0.0, 1.0 ), clamp( hsl.z * 0.92, 0.0, 1.0 ) );
+    // 薄色：同色相，饱和度 −14%、明度 +8%（颜料薄了、透出底子）
+    vec3 thin  = vec3( hsl.x, clamp( hsl.y * 0.86, 0.0, 1.0 ), clamp( hsl.z * 1.08, 0.0, 1.0 ) );
+
+    gl_FragColor.rgb = clamp(
+      prSrgb2Lin( mix( prHsl2Rgb( thin ), prHsl2Rgb( heavy ), w ) ), 0.0, 1.0 );
+  }
+`;
+
+function toon(color, extra) {
+  const m = new THREE.MeshToonMaterial(Object.assign({ color: color, gradientMap: gradientMap }, extra || {}));
+  registerTint(m);
+  m.onBeforeCompile = function (shader) {
+    shader.uniforms.gradientMap = { value: gradientMap };
+    shader.uniforms.uBodyAmp = U.uBodyAmp;
+    shader.uniforms.uLowAmp  = U.uLowAmp;
+    shader.uniforms.uHighAmp = U.uHighAmp;
+    shader.uniforms.uInk     = U.uInk;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vPrPos;\nvarying float vPrDist;')
+      .replace('#include <begin_vertex>', [
+        '#include <begin_vertex>',
+        'vec4 prWorld = modelMatrix * vec4( transformed, 1.0 );',
+        'vPrPos  = prWorld.xyz;',
+        'vPrDist = -( viewMatrix * prWorld ).z;'
+      ].join('\n'));
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <gradientmap_pars_fragment>', GRADIENT_PARS)
+      .replace('#include <opaque_fragment>', PIGMENT_MIX);
+  };
+  return m;
+}
+
+const outlineMeshes = [];
+let outlineSeed = 0;
+
+// 勾线起毛：在顶点 shader 里沿法线做噪声位移，让描边粗细不匀、边缘发毛（手绘线的感觉）
+const V_NOISE3 = `
+  uniform float uWobble;
+  uniform float uWobFreq;
+  uniform float uWobScale;
+  uniform vec3  uWobSeed;
+  float prHash3(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123); }
+  float prNoise3(vec3 p){
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = prHash3(i);
+    float n100 = prHash3(i + vec3(1.0, 0.0, 0.0));
+    float n010 = prHash3(i + vec3(0.0, 1.0, 0.0));
+    float n110 = prHash3(i + vec3(1.0, 1.0, 0.0));
+    float n001 = prHash3(i + vec3(0.0, 0.0, 1.0));
+    float n101 = prHash3(i + vec3(1.0, 0.0, 1.0));
+    float n011 = prHash3(i + vec3(0.0, 1.0, 1.0));
+    float n111 = prHash3(i + vec3(1.0, 1.0, 1.0));
+    float nx00 = mix(n000, n100, f.x), nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x), nx11 = mix(n011, n111, f.x);
+    return mix( mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z );
+  }
+`;
+
+function makeOutlineMat(radius, k) {
+  const m = new THREE.MeshBasicMaterial({ color: INK, side: THREE.BackSide });
+  registerTint(m);
+  const r = Math.max(0.05, radius || 0.5);
+  const lineW = r * (Math.max(1.001, k || 1.045) - 1);   // 描边的大致线宽
+  const seed = (outlineSeed += 1) * 3.77;
+  m.userData.wobble = { value: Math.max(0.004, lineW * 1.1) };   // 抖动幅度 ≈ 一个线宽
+  m.userData.wobSeed = { value: new THREE.Vector3(seed * 0.31, seed * 0.57, seed * 0.83) };
+  m.userData.wobFreq = { value: 1.0 / (r * 1.1) };
+  m.onBeforeCompile = function (shader) {
+    shader.uniforms.uWobble   = m.userData.wobble;
+    shader.uniforms.uWobSeed  = m.userData.wobSeed;
+    shader.uniforms.uWobFreq  = m.userData.wobFreq;
+    shader.uniforms.uWobScale = U.uOutlineWob;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + V_NOISE3)
+      .replace('#include <begin_vertex>', [
+        '#include <begin_vertex>',
+        'transformed += normal * ( prNoise3( position * uWobFreq + uWobSeed ) - 0.5 ) * uWobble * uWobScale;'
+      ].join('\n'));
+  };
+  return m;
+}
+
+// 造一个带描边的物件：几何体要大致居中，描边靠整体 scale 向外长
+function piece(geo, mat, opt) {
+  opt = opt || {};
+  const g = new THREE.Group();
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = opt.castShadow !== false;
+  mesh.receiveShadow = opt.receiveShadow !== false;
+  g.add(mesh);
+  if (opt.outline !== false) {
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const om = new THREE.Mesh(geo, makeOutlineMat(geo.boundingSphere.radius, opt.k || 1.045));
+    om.scale.setScalar(opt.k || 1.045);
+    om.castShadow = false; om.receiveShadow = false;
+    om.visible = P.outline;
+    outlineMeshes.push(om);
+    g.add(om);
+  }
+  if (opt.pos) g.position.set(opt.pos[0], opt.pos[1], opt.pos[2]);
+  if (opt.rot) g.rotation.set(opt.rot[0], opt.rot[1], opt.rot[2]);
+  if (opt.scale) g.scale.set(opt.scale[0], opt.scale[1], opt.scale[2]);
+  return g;
+}
+
+// ─────────────────────────── 草地 ───────────────────────────
+const grassGeo = new THREE.PlaneGeometry(120, 120, 64, 64);
+grassGeo.rotateX(-Math.PI / 2);
+{
+  const pos = grassGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const d = Math.hypot(x, z);
+    let y = Math.sin(x * 0.14) * 0.13 + Math.cos(z * 0.11) * 0.11 + Math.sin((x + z) * 0.31) * 0.045;
+    y *= Math.min(1, d / 7);                   // 房子附近压平
+    y += Math.max(0, d - 26) * 0.075;          // 远处缓缓抬起成丘
+    pos.setY(i, y);
+  }
+  grassGeo.computeVertexNormals();
+}
+const grass = new THREE.Mesh(grassGeo, toon(0x8cbb63));
+grass.receiveShadow = true;
+scene.add(grass);
+
+// ─────────────────────────── 房子 ───────────────────────────
+const house = new THREE.Group();
+const W = 2.3, H = 1.5, D = 1.7;   // 墙
+
+house.add(piece(new THREE.BoxGeometry(W, H, D),
+  toon(0xf5e9d2), { pos: [0, H / 2, 0], k: 1.022 }));
+
+// 屋顶：三角形截面挤出 → 双坡顶
+(function () {
+  const halfW = W / 2 + 0.26, rise = 0.98, depth = D + 0.46;
+  const shape = new THREE.Shape();
+  shape.moveTo(-halfW, 0); shape.lineTo(0, rise); shape.lineTo(halfW, 0); shape.lineTo(-halfW, 0);
+  const roof = new THREE.ExtrudeGeometry(shape, { depth: depth, bevelEnabled: false });
+  roof.translate(0, 0, -depth / 2);
+  house.add(piece(roof, toon(0xb45f4d), { pos: [0, H - 0.02, 0], k: 1.02 }));
+})();
+
+// 烟囱
+house.add(piece(new THREE.BoxGeometry(0.3, 0.8, 0.3),
+  toon(0xa9664f), { pos: [0.72, H + 0.62, -0.34], k: 1.04 }));
+
+// 门 + 门把手
+house.add(piece(new THREE.BoxGeometry(0.52, 0.88, 0.07),
+  toon(0x7c4a3c), { pos: [-0.62, 0.44, D / 2 + 0.02], k: 1.06 }));
+house.add(piece(new THREE.SphereGeometry(0.035, 8, 6),
+  toon(0xd8c07a), { pos: [-0.44, 0.46, D / 2 + 0.07], k: 1.1, castShadow: false }));
+
+// 两扇窗（玻璃 + 白框）
+[[0.42, 0.92], [1.02, 0.92]].forEach(function (p) {
+  house.add(piece(new THREE.BoxGeometry(0.46, 0.42, 0.06),
+    toon(0x8fc4dd, { emissive: 0x1a2b33, emissiveIntensity: 0.35 }),
+    { pos: [p[0], p[1], D / 2 + 0.02], k: 1.06 }));
+  house.add(piece(new THREE.BoxGeometry(0.56, 0.52, 0.03),
+    toon(0xfbf6ea), { pos: [p[0], p[1], D / 2 + 0.0], k: 1.035, castShadow: false }));
+});
+
+// 门口台阶
+house.add(piece(new THREE.BoxGeometry(0.86, 0.12, 0.42),
+  toon(0xc9bfa6), { pos: [-0.62, 0.06, D / 2 + 0.16], k: 1.05 }));
+house.add(piece(new THREE.BoxGeometry(1.0, 0.1, 0.62),
+  toon(0xbfb49a), { pos: [-0.62, 0.02, D / 2 + 0.26], k: 1.05 }));
+
+house.position.set(-0.5, 0, 0.4);
+house.rotation.y = -0.13;
+scene.add(house);
+
+// ─────────────────────────── 栅栏 ───────────────────────────
+const fence = new THREE.Group();
+const woodMat = toon(0xf2ecdc);
+const railMat = toon(0xeae2cf);
+for (let i = 0; i < 13; i++) {
+  const x = -3.1 + i * 0.42;
+  fence.add(piece(new THREE.BoxGeometry(0.075, 0.56, 0.075),
+    woodMat, { pos: [x, 0.3, 0], k: 1.14, castShadow: false }));
+}
+[0.40, 0.16].forEach(function (y) {
+  fence.add(piece(new THREE.BoxGeometry(3.5, 0.07, 0.05),
+    railMat, { pos: [-0.58, y, 0], k: 1.06, castShadow: false }));
+});
+fence.position.set(-0.4, 0, 2.5);
+fence.rotation.y = -0.06;
+scene.add(fence);
+
+// ─────────────────────────── 邮箱（游戏核心小物） ───────────────────────────
+const mailbox = new THREE.Group();
+mailbox.add(piece(new THREE.BoxGeometry(0.07, 0.72, 0.07),
+  toon(0x8a6a52), { pos: [0, 0.36, 0], k: 1.12 }));
+mailbox.add(piece(new THREE.BoxGeometry(0.06, 0.34, 0.06),
+  toon(0x8a6a52), { pos: [0, 0.16, 0.16], rot: [0.5, 0, 0], k: 1.14 }));
+mailbox.add(piece(new THREE.BoxGeometry(0.26, 0.24, 0.44),
+  toon(0x5f83ab), { pos: [0, 0.82, 0], k: 1.06 }));
+mailbox.add(piece(new THREE.CylinderGeometry(0.13, 0.13, 0.26, 12, 1, false, 0, Math.PI),
+  toon(0x5f83ab), { pos: [0, 0.94, 0], rot: [0, 0, Math.PI / 2], k: 1.06, castShadow: false }));
+mailbox.add(piece(new THREE.BoxGeometry(0.03, 0.2, 0.03),
+  toon(0xc4593f), { pos: [0.16, 1.06, 0], k: 1.2, castShadow: false }));
+mailbox.position.set(1.85, 0, 2.15);
+mailbox.rotation.y = -0.3;
+scene.add(mailbox);
+
+// ─────────────────────────── 树 ───────────────────────────
+function tree(x, z, s, rotY) {
+  const t = new THREE.Group();
+  t.add(piece(new THREE.CylinderGeometry(0.1, 0.15, 1.05, 7),
+    toon(0x6d4b37), { pos: [0, 0.52, 0], k: 1.07 }));
+  const leaf = [0x5c9146, 0x68a04e, 0x548644];
+  [[0, 1.62, 0, 0.76], [-0.42, 1.32, 0.16, 0.52], [0.4, 1.38, -0.14, 0.5], [0.05, 2.28, -0.06, 0.42]]
+    .forEach(function (b, i) {
+      t.add(piece(new THREE.IcosahedronGeometry(b[3], 1),
+        toon(leaf[i % leaf.length]),
+        { pos: [b[0], b[1], b[2]], rot: [i * 0.7, i * 1.1, i * 0.4], k: 1.035 }));
+    });
+  t.position.set(x, 0, z);
+  t.rotation.y = rotY;
+  t.scale.setScalar(s);
+  scene.add(t);
+  return t;
+}
+tree(-3.6, -1.2, 1.15, 0.4);
+tree(4.4, -3.0, 0.85, 2.1);
+tree(-6.2, 2.6, 0.7, 1.2);
+
+// 灌木
+function bush(x, z, s, color) {
+  const b = piece(new THREE.IcosahedronGeometry(0.4, 1), toon(color),
+    { pos: [x, 0.26, z], scale: [1, 0.78, 1], k: 1.05 });
+  b.scale.multiplyScalar(s);
+  scene.add(b);
+}
+bush(1.35, 1.5, 1.0, 0x5f9247);
+bush(2.15, 1.05, 0.7, 0x6ba152);
+bush(-2.35, 1.75, 0.85, 0x56893f);
+
+// ─────────────────────────── 远山 ───────────────────────────
+function hill(x, z, r, h, color) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14),
+    toon(color, { fog: true }));
+  m.scale.set(1, h / r, 1);
+  m.position.set(x, -r * 0.42, z);
+  m.castShadow = false; m.receiveShadow = false;
+  scene.add(m);
+}
+hill(-46, -62, 26, 11, 0x9fbfa4);
+hill(-8, -74, 30, 14, 0x93b6a2);
+hill(38, -66, 24, 10, 0xa6c3a8);
+hill(66, -44, 20, 8, 0xa9c6ad);
+
+// ─────────────────────────── 云 ───────────────────────────
+function cloud(x, y, z, s) {
+  const g = new THREE.Group();
+  const mat = toon(0xfcfbf6);
+  [[0, 0, 0, 1.0], [0.85, -0.1, 0.16, 0.74], [-0.82, -0.14, -0.1, 0.68], [0.3, 0.34, -0.2, 0.6], [-0.34, 0.28, 0.14, 0.54]]
+    .forEach(function (b) {
+      g.add(piece(new THREE.IcosahedronGeometry(b[3], 1), mat,
+        { pos: [b[0], b[1], b[2]], rot: [b[0], b[1] * 2, b[2]], k: 1.02, castShadow: false, receiveShadow: false }));
+    });
+  g.position.set(x, y, z);
+  g.scale.setScalar(s);
+  scene.add(g);
+  return g;
+}
+cloud(-14, 13, -26, 2.0);
+cloud(9, 15.5, -34, 2.6);
+cloud(26, 12.5, -16, 1.7);
+cloud(-30, 11, 4, 1.5);
+
+// ─────────────────────────── 相机 / 简易轨道控制 ───────────────────────────
+const target = new THREE.Vector3(-0.2, 1.10, 0.4);
+let theta = 0.72, phi = 1.38, radius = 9.2;
+
+function placeCamera() {
+  camera.position.set(
+    target.x + radius * Math.sin(phi) * Math.sin(theta),
+    target.y + radius * Math.cos(phi),
+    target.z + radius * Math.sin(phi) * Math.cos(theta)
+  );
+  camera.lookAt(target);
+  needsDraw = true;
+}
+placeCamera();
+
+let dragging = false, lastX = 0, lastY = 0;
+paper.addEventListener('pointerdown', function (e) {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  paper.classList.add('drag');
+  paper.setPointerCapture(e.pointerId);
+});
+paper.addEventListener('pointermove', function (e) {
+  if (!dragging) return;
+  theta -= (e.clientX - lastX) * 0.006;
+  phi = Math.max(0.22, Math.min(1.46, phi - (e.clientY - lastY) * 0.005));
+  lastX = e.clientX; lastY = e.clientY;
+  placeCamera();
+});
+function endDrag(e) {
+  if (!dragging) return;
+  dragging = false;
+  paper.classList.remove('drag');
+  try { paper.releasePointerCapture(e.pointerId); } catch (err) {}
+}
+paper.addEventListener('pointerup', endDrag);
+paper.addEventListener('pointercancel', endDrag);
+paper.addEventListener('wheel', function (e) {
+  e.preventDefault();
+  radius = Math.max(3.6, Math.min(30, radius * Math.exp(e.deltaY * 0.0011)));
+  placeCamera();
+}, { passive: false });
+
+// ─────────────────────────── 纸纹颗粒（预生成 tile，绝不用逐像素全屏） ───────────────────────────
+// 两张颗粒 tile：
+//   screen 用的中值是"黑"（只提亮），multiply 用的中值是"白"（只压暗）。
+// 单向的 soft-light 在暗部会结成一坨黑斑（杨过：'纹理是黑色的'），这样就不会。
+function grainTiles(size, seed) {
+  const cs = document.createElement('canvas'), cm = document.createElement('canvas');
+  cs.width = cs.height = cm.width = cm.height = size;
+  const xs = cs.getContext('2d'), xm = cm.getContext('2d');
+  const is = xs.createImageData(size, size), im2 = xm.createImageData(size, size);
+  const ds = is.data, dm = im2.data;
+  let s = seed >>> 0;
+  const rnd = function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  for (let i = 0; i < size * size; i++) {
+    const px = i % size, py = (i / size) | 0;
+    const fibre = Math.sin(py * 0.55) * 6.0 + Math.sin(px * 0.07 + py * 0.9) * 4.6;  // 纸纤维
+    const n = (rnd() - 0.5) * 34 + (rnd() - 0.5) * 20 + fibre;                       // 居中在 0
+    const vs = Math.max(0, Math.min(255, 34 + n));        // 提亮侧：中值 34
+    const vm = Math.max(0, Math.min(255, 221 - n));       // 压暗侧：中值 221
+    ds[i * 4] = ds[i * 4 + 1] = ds[i * 4 + 2] = vs; ds[i * 4 + 3] = 255;
+    dm[i * 4] = dm[i * 4 + 1] = dm[i * 4 + 2] = vm; dm[i * 4 + 3] = 255;
+  }
+  xs.putImageData(is, 0, 0);
+  xm.putImageData(im2, 0, 0);
+  return [cs, cm];
+}
+let grainScreen = null, grainMultiply = null;
+{
+  const t = grainTiles(256, 20240607);
+  grainScreen = pctx.createPattern(t[0], 'repeat');
+  grainMultiply = pctx.createPattern(t[1], 'repeat');
+}
+
+// ─────────────────────────── 尺寸 ───────────────────────────
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, h, false);
+  glCanvas.style.width = w + 'px'; glCanvas.style.height = h + 'px';
+  paper.width = Math.round(w * dpr); paper.height = Math.round(h * dpr);
+  paper.style.width = w + 'px'; paper.style.height = h + 'px';
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  needsDraw = true;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ─────────────────────────── 主循环 ───────────────────────────
+let frames = 0;
+
+function composite() {
+  pctx.globalCompositeOperation = 'source-over';
+  pctx.globalAlpha = 1;
+  pctx.clearRect(0, 0, paper.width, paper.height);
+  pctx.drawImage(glCanvas, 0, 0, paper.width, paper.height);
+  if (P.grainOn && P.grain > 0.001 && grainScreen) {
+    pctx.globalCompositeOperation = 'screen';
+    pctx.globalAlpha = P.grain;
+    pctx.fillStyle = grainScreen;
+    pctx.fillRect(0, 0, paper.width, paper.height);
+    pctx.globalCompositeOperation = 'multiply';
+    pctx.globalAlpha = P.grain;
+    pctx.fillStyle = grainMultiply;
+    pctx.fillRect(0, 0, paper.width, paper.height);
+  }
+  pctx.globalCompositeOperation = 'source-over';
+  pctx.globalAlpha = 1;
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (!needsDraw && frames > 90) return;   // 静止就不干活
+  frames++;
+  needsDraw = false;
+  renderer.render(scene, camera);
+  composite();
+}
+loop();
+
+// 初始化完再多画几帧，保证纹理/编译都就位
+let warm = 0;
+const warmTimer = setInterval(function () {
+  needsDraw = true;
+  if (++warm > 14) clearInterval(warmTimer);
+}, 60);
+
+// ─────────────────────────── HUD 绑定 ───────────────────────────
+function bind(id, outId, key, onChange) {
+  const el = document.getElementById(id);
+  const out = document.getElementById(outId);
+  el.value = String(P[key]);
+  out.textContent = Number(P[key]).toFixed(3);
+  el.addEventListener('input', function () {
+    P[key] = parseFloat(el.value);
+    out.textContent = P[key].toFixed(3);
+    if (onChange) onChange(P[key]);
+    needsDraw = true;
+  });
+  return el;
+}
+bind('s-body', 'o-body', 'bodyAmp', function (v) { U.uBodyAmp.value = P.perturb ? v : 0; });
+bind('s-low',  'o-low',  'lowAmp',  function (v) { U.uLowAmp.value  = P.perturb ? v : 0; });
+bind('s-high', 'o-high', 'highAmp', function (v) { U.uHighAmp.value = P.perturb ? v : 0; });
+bind('s-ink',  'o-ink',  'ink',     function (v) { U.uInk.value     = P.perturb ? v : 0; });
+bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.perturb ? v : 0; });
+bind('s-grain', 'o-grain', 'grain');
+
+function setOutline(on) {
+  P.outline = on;
+  outlineMeshes.forEach(function (m) { m.visible = on; });
+  needsDraw = true;
+}
+function setPerturb(on) {
+  P.perturb = on;
+  U.uBodyAmp.value = on ? P.bodyAmp : 0;
+  U.uLowAmp.value  = on ? P.lowAmp : 0;
+  U.uHighAmp.value = on ? P.highAmp : 0;
+  U.uInk.value     = on ? P.ink : 0;
+  U.uOutlineWob.value = on ? P.wobble : 0;
+  needsDraw = true;
+}
+function setGrain(on) { P.grainOn = on; needsDraw = true; }
+
+// ─────────────────────────── 自动配色 ───────────────────────────
+// 思路：不动各个物体的"角色"（草地是绿的、屋顶是红棕的），只把整套颜色
+// 沿色相环整体旋转 + 统一调饱和度/明度。相对色相不变 → 转到哪儿都还协调。
+const SCHEMES = {
+  '晴日 · 原味':     { hue:  0.000, sat: 1.00, light: 1.00 },
+  '清晨 · 冷冽':     { hue: -0.028, sat: 0.88, light: 1.06 },
+  '黄昏 · 暖橙':     { hue:  0.052, sat: 1.10, light: 0.95 },
+  '阴天 · 低饱和':   { hue:  0.008, sat: 0.58, light: 1.05 },
+  '高饱和 · 动漫':   { hue:  0.000, sat: 1.50, light: 1.02 },
+  '褪色 · 旧照片':   { hue: -0.012, sat: 0.40, light: 1.03 }
+};
+const tintCache = new THREE.Color();
+function tintOf(base, hs, sm, lm) {
+  const hsl = { h: 0, s: 0, l: 0 };
+  base.getHSL(hsl, THREE.SRGBColorSpace);
+  tintCache.setHSL((hsl.h + hs + 1) % 1, Math.min(1, hsl.s * sm), Math.min(1, hsl.l * lm), THREE.SRGBColorSpace);
+  return tintCache;
+}
+function applyTint(hs, sm, lm) {
+  tintList.forEach(function (e) {
+    e.mat.color.setHSL((e.h + hs + 1) % 1, Math.min(1, e.s * sm), Math.min(1, e.l * lm), THREE.SRGBColorSpace);
+  });
+  paintSky(hs, sm, lm);
+  scene.fog.color.copy(tintOf(FOG_BASE, hs, sm, lm));
+  sun.color.copy(tintOf(SUN_BASE, hs, sm, lm));
+  amb.color.copy(tintOf(AMB_BASE, hs, sm, lm));
+  fill.color.copy(tintOf(FILL_BASE, hs, sm, lm));
+  needsDraw = true;
+}
+function applyScheme(name) {
+  const sc = SCHEMES[name] || SCHEMES['晴日 · 原味'];
+  applyTint(sc.hue, sc.sat, sc.light);
+}
+
+const schemeSel = document.getElementById('s-scheme');
+Object.keys(SCHEMES).forEach(function (k) {
+  const o = document.createElement('option');
+  o.value = k; o.textContent = k;
+  schemeSel.appendChild(o);
+});
+schemeSel.addEventListener('change', function () { applyScheme(schemeSel.value); });
+document.getElementById('btn-random').addEventListener('click', function () {
+  // 随机和声：随便转一个色相，配比不动，所以怎么转都不脏
+  applyTint(Math.random() * 1.0 - 0.5, 0.72 + Math.random() * 0.75, 0.93 + Math.random() * 0.14);
+});
+
+window.addEventListener('keydown', function (e) {
+  const k = e.key.toLowerCase();
+  if (k === 'p') setGrain(!P.grainOn);
+  else if (k === 'o') setOutline(!P.outline);
+  else if (k === 'c') setPerturb(!P.perturb);
+  else if (k === 'r') { theta = 0.72; phi = 1.38; radius = 9.2; placeCamera(); }
+});
+
+// ─────────────────────────── 调试口（给 agent 采样用） ───────────────────────────
+window.__lab.setParam = function (k, v) {
+  P[k] = v;
+  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain' }[k]);
+  if (el) { el.value = String(v); }
+  if (k === 'bodyAmp') U.uBodyAmp.value = v;
+  if (k === 'wobble') U.uOutlineWob.value = v;
+  if (k === 'lowAmp') U.uLowAmp.value = v;
+  if (k === 'highAmp') U.uHighAmp.value = v;
+  if (k === 'ink') U.uInk.value = v;
+  needsDraw = true;
+};
+window.__lab.sample = function (x, y) {
+  const d = pctx.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+  return [d[0], d[1], d[2]];
+};
+// 同步渲染 + 合成一次，方便外部脚本立刻采样（不用等 requestAnimationFrame）
+window.__lab.renderNow = function () {
+  renderer.render(scene, camera);
+  composite();
+  return true;
+};
+// 直接设视角：theta 水平角 / phi 极角 / radius 距离
+window.__lab.setView = function (t, p, r) {
+  theta = t; phi = p; radius = r;
+  placeCamera();
+  return true;
+};
+window.__lab.setScheme = function (name) { applyScheme(name); return true; };
+window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return true; };
+window.__lab.tintCount = function () { return tintList.length; };
+window.__lab.patch = function (x, y, w, h) {
+  const d = pctx.getImageData(Math.round(x), Math.round(y), Math.round(w), Math.round(h)).data;
+  let r = 0, g = 0, b = 0, n = 0, min = 255, max = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+    const lum = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114);
+    if (lum < min) min = lum;
+    if (lum > max) max = lum;
+  }
+  return { rgb: [Math.round(r / n), Math.round(g / n), Math.round(b / n)], lumMin: Math.round(min), lumMax: Math.round(max) };
+};
+window.__lab.info = function () {
+  return {
+    three: THREE.REVISION,
+    triangles: renderer.info.render.triangles,
+    calls: renderer.info.render.calls,
+    programs: renderer.info.programs ? renderer.info.programs.length : -1,
+    size: [paper.width, paper.height],
+    params: Object.assign({}, P),
+    outlines: outlineMeshes.length,
+    errors: window.__lab.errors
+  };
+};
+window.__lab.ready = true;
+</script>
+</body>
+</html>
