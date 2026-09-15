@@ -36,7 +36,7 @@
   #hud .dim{opacity:.62}
   kbd{border:1px solid rgba(64,48,44,.28);border-bottom-width:2px;border-radius:4px;
     padding:0 4px;font:11px/1.6 ui-monospace,monospace;background:rgba(255,255,255,.6)}
-  label.sl{display:flex;align-items:center;gap:6px;white-space:nowrap}
+  label.sl{display:flex;align-items:center;gap:6px;white-space:nowrap;flex:0 0 auto}
   label.sl input[type=range]{width:104px;accent-color:#7a9a5b;height:16px}
   label.sl output{font:11px/1 ui-monospace,monospace;opacity:.7;width:44px;text-align:right}
   label.ck{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
@@ -68,9 +68,11 @@
     <label class="sl">色块抖动 <input id="s-low" type="range" min="0" max="0.40" step="0.005"><output id="o-low"></output></label>
     <label class="sl">交界起毛 <input id="s-high" type="range" min="0" max="0.30" step="0.005"><output id="o-high"></output></label>
     <label class="sl">交界印痕 <input id="s-ink" type="range" min="0" max="0.50" step="0.005"><output id="o-ink"></output></label>
+  </div>
+  <div class="row">
     <label class="sl">勾线起毛 <input id="s-wobble" type="range" min="0" max="3" step="0.05"><output id="o-wobble"></output></label>
     <label class="sl">纸纹 <input id="s-grain" type="range" min="0" max="0.70" step="0.01"><output id="o-grain"></output></label>
-    <label class="sl">水粉肌理 <input id="s-atlas" type="range" min="0" max="1" step="0.01"><output id="o-atlas"></output></label>
+    <label class="sl">水粉肌理 <input id="s-atlas" type="range" min="0" max="1.6" step="0.01"><output id="o-atlas"></output></label>
   </div>
   <div class="row">
     <label class="sl">配色 <select id="s-scheme"></select></label>
@@ -126,7 +128,7 @@ const P = {
   wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
   grain:   0.280,   // 纸纹强度
   grainOn: true,
-  atlas:   0.700,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
+  atlas:   0.750,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
   atlasScale: 0.55, // 肌理取样尺度（格/世界米）
   atlasCell: -1,    // 手动指定用哪一格（0~8）；-1 = 按材质本色自动分配
   outline: true,
@@ -364,6 +366,7 @@ const ATLAS_N = 3;
 const ATLAS_PX = 512;                 // 重采样到 2 的幂，mipmap 才稳
 const PR_SRGB2LIN = new Float32Array(256);
 for (let i = 0; i < 256; i++) PR_SRGB2LIN[i] = Math.pow(i / 255, 2.2);
+const ATLAS_CONTRAST = 1.8;           // 手绘水粉太淡，先把每格的对比度拉起来（拉太狠会出黑点）
 const atlasU = [];                    // 每格 { tex:{value}, mean:{value} }，材质共享引用
 for (let i = 0; i < ATLAS_N * ATLAS_N; i++) atlasU.push({ tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) } });
 const uPrAtlasK     = { value: 0 };   // 先关着，图集加载完再打开（免得采样到未绑定的纹理）
@@ -437,6 +440,21 @@ function paintAtlasPicker(img) {
         const x = c.getContext('2d');
         x.drawImage(img, col * cw, row * ch, cw, ch, 0, 0, ATLAS_PX, ATLAS_PX);
         const d = x.getImageData(0, 0, ATLAS_PX, ATLAS_PX).data;
+
+        // 手绘水粉本身的对比度极低（每格 sd 只有 3.6~13），直接乘上去肉眼几乎看不见。
+        // 先围绕每格自己的均值做对比拉伸；均值不变，所以下面的归一化照样成立。
+        let mr = 0, mg = 0, mb = 0;
+        for (let i = 0; i < d.length; i += 4) { mr += d[i]; mg += d[i + 1]; mb += d[i + 2]; }
+        const cnt = d.length / 4;
+        mr /= cnt; mg /= cnt; mb /= cnt;
+        const K = ATLAS_CONTRAST;
+        for (let i = 0; i < d.length; i += 4) {
+          d[i]     = Math.max(0, Math.min(255, (d[i]     - mr) * K + mr));
+          d[i + 1] = Math.max(0, Math.min(255, (d[i + 1] - mg) * K + mg));
+          d[i + 2] = Math.max(0, Math.min(255, (d[i + 2] - mb) * K + mb));
+        }
+        x.putImageData(new ImageData(d, ATLAS_PX, ATLAS_PX), 0, 0);
+
         // 均值必须在 **linear 空间**算：纹理会做 sRGB→linear 解码，
         // 在 sRGB 上求的均值对不上，结果就是整片被压暗（暗部还会增多）。
         let sr = 0, sg = 0, sb = 0, n = 0;
