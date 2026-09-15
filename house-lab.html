@@ -45,8 +45,8 @@
     background:rgba(255,255,255,.85);border:1px solid rgba(64,48,44,.28);
     border-radius:6px;padding:3px 8px;cursor:pointer}
   #hud button:hover{background:#fff}
-  #atlas-pick{width:96px;height:96px;border:1px solid rgba(64,48,44,.28);border-radius:6px;
-    background:#fff;cursor:pointer;display:block}
+  #atlas-pick{position:static;width:96px;height:96px;border:1px solid rgba(64,48,44,.28);
+    border-radius:6px;background:#fff;cursor:pointer;display:block}
   #err{position:fixed;left:14px;top:14px;z-index:20;max-width:64ch;display:none;white-space:pre-wrap;
     background:#fff4f1;border:1px solid #d98b7a;border-radius:8px;padding:8px 11px;font-size:12px}
 </style>
@@ -80,7 +80,7 @@
   <div class="row">
     <label class="sl">肌理格 <select id="s-atlas-cell"></select></label>
     <canvas id="atlas-pick" width="144" height="144" title="点格子直接选"></canvas>
-    <span class="dim">缩略图就是 gouache-atlas.png（3×3，横/纵读数）。<br>选「自动」时按材质本色分配：绿=草地、砖红=屋瓦、棕=木纹、浅色=壁板</span>
+    <span class="dim">缩略图就是 gouache-atlas.png（3×3）。<br>「自动」按材质本色分配：绿→绿色笔触、红砖→屋瓦、深棕→竖纹木板、浅色→横向壁板</span>
   </div>
 </div>
 
@@ -126,7 +126,7 @@ const P = {
   wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
   grain:   0.280,   // 纸纹强度
   grainOn: true,
-  atlas:   0.520,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
+  atlas:   0.700,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
   atlasScale: 0.55, // 肌理取样尺度（格/世界米）
   atlasCell: -1,    // 手动指定用哪一格（0~8）；-1 = 按材质本色自动分配
   outline: true,
@@ -367,26 +367,37 @@ for (let i = 0; i < 256; i++) PR_SRGB2LIN[i] = Math.pow(i / 255, 2.2);
 const atlasU = [];                    // 每格 { tex:{value}, mean:{value} }，材质共享引用
 for (let i = 0; i < ATLAS_N * ATLAS_N; i++) atlasU.push({ tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) } });
 const uPrAtlasK     = { value: 0 };   // 先关着，图集加载完再打开（免得采样到未绑定的纹理）
-const uPrAtlasScale = { value: P.atlasScale };
+// 取样尺度改成每材质一份（slot.scale），见 makeAtlasSlot / setAtlasCell
 
-// 按材质本色挑一格。格子身份是从图集里量出来的方向性猜的：
-//   0 r0c0 强横纹(2.5) → 壁板    1 r0c1 强竖纹(0.31) → 木板    2 r0c2 各向同性
-//   3 r1c0 中等       4 r1c1 行纹 → 屋瓦    5 r1c2 高频最强 → 草地
-//   6 r2c0 中等       7 r2c1 最平滑 → 灰泥    8 r2c2 中等
+// 图集九格的实际身份（看图确认过的，行×列）：
+//   0 (0,0) 竖纹木板      1 (0,1) 横向壁板(板条线)  2 (0,2) 灰泥/水渍墙
+//   3 (1,0) 深灰抹灰      4 (1,1) 屋瓦(shingle)     5 (1,2) 帆布/麻布
+//   6 (2,0) 奶油色水粉    7 (2,1) 平滑粉刷墙        8 (2,2) 绿色笔触(草/叶)
+const C_WOOD = 0, C_SIDING = 1, C_STUCCO = 2, C_PLASTER_DARK = 3,
+      C_SHINGLE = 4, C_CANVAS = 5, C_CREAM = 6, C_PLASTER = 7, C_LEAF = 8;
+
 function atlasCellFor(mat) {
   const hsl = { h: 0, s: 0, l: 0 };
   mat.color.getHSL(hsl, THREE.SRGBColorSpace);
   const h = hsl.h, s = hsl.s, l = hsl.l;
-  if (s > 0.25 && h > 0.17 && h < 0.47) return 5;               // 绿 → 草地
-  if (s > 0.28 && (h < 0.055 || h > 0.94)) return 4;            // 红 / 砖 → 屋瓦
-  if (s > 0.12 && h >= 0.035 && h < 0.14 && l < 0.62) return 1; // 棕木 → 木纹
-  return 0;                                                     // 默认：壁板（横纹，最有"手绘墙"感）
+  if (s > 0.18 && h > 0.17 && h < 0.47) return C_LEAF;          // 绿 → 草 / 树叶
+  if (s > 0.22 && (h < 0.055 || h > 0.94)) return C_SHINGLE;    // 红砖 → 屋瓦
+  if (h >= 0.03 && h < 0.15 && l < 0.62) return C_WOOD;         // 深棕 → 竖纹木板
+  if (s > 0.12 && h >= 0.47 && h < 0.75) return C_PLASTER;      // 蓝灰 → 平滑粉刷
+  if (l > 0.82) return C_SIDING;                                // 浅色 → 横向壁板
+  return C_STUCCO;                                              // 其余 → 灰泥
 }
+
+// 不同表面要的肌理密度不一样：草要密（像一簇簇草叶），木头略密，墙面保持 1 倍
+const ATLAS_SCALE_MUL = {};
+ATLAS_SCALE_MUL[C_LEAF] = 3.2;
+ATLAS_SCALE_MUL[C_WOOD] = 1.5;
+ATLAS_SCALE_MUL[C_SHINGLE] = 1.1;
 
 // 每个材质拿一份自己的肌理格容器（不直接共用 atlasU，才能手动换格）
 const atlasMats = [];
 function makeAtlasSlot() {
-  return { tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) } };
+  return { tex: { value: null }, mean: { value: new THREE.Vector3(1, 1, 1) }, scale: { value: P.atlasScale } };
 }
 // idx = -1 → 按材质本色自动；0~8 → 全场统一用那一格
 function setAtlasCell(idx) {
@@ -395,6 +406,7 @@ function setAtlasCell(idx) {
     const c = (idx < 0) ? e.auto : idx;
     e.slot.tex.value = atlasU[c].tex.value;
     e.slot.mean.value.copy(atlasU[c].mean.value);
+    e.slot.scale.value = P.atlasScale * (ATLAS_SCALE_MUL[c] || 1);
   });
   needsDraw = true;
 }
@@ -480,11 +492,11 @@ const PIGMENT_MIX = `
   }
 `;
 
-function toon(color, extra) {
+function toon(color, extra, cell) {
   const m = new THREE.MeshToonMaterial(Object.assign({ color: color, gradientMap: gradientMap }, extra || {}));
   registerTint(m);
   const slot = makeAtlasSlot();
-  atlasMats.push({ slot: slot, auto: atlasCellFor(m) });
+  atlasMats.push({ slot: slot, auto: (cell === undefined ? atlasCellFor(m) : cell) });
   m.onBeforeCompile = function (shader) {
     shader.uniforms.gradientMap = { value: gradientMap };
     shader.uniforms.uBodyAmp = U.uBodyAmp;
@@ -494,7 +506,7 @@ function toon(color, extra) {
     shader.uniforms.uPrAtlas      = slot.tex;      // 每材质一份容器：换格立刻生效
     shader.uniforms.uPrAtlasMean  = slot.mean;
     shader.uniforms.uPrAtlasK     = uPrAtlasK;
-    shader.uniforms.uPrAtlasScale = uPrAtlasScale;
+    shader.uniforms.uPrAtlasScale = slot.scale;
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vPrPos;\nvarying float vPrDist;')
       .replace('#include <begin_vertex>', [
@@ -634,10 +646,10 @@ house.add(piece(new THREE.SphereGeometry(0.035, 8, 6),
 // 两扇窗（玻璃 + 白框）
 [[0.42, 0.92], [1.02, 0.92]].forEach(function (p) {
   house.add(piece(new THREE.BoxGeometry(0.46, 0.42, 0.06),
-    toon(0x8fc4dd, { emissive: 0x1a2b33, emissiveIntensity: 0.35 }),
+    toon(0x8fc4dd, { emissive: 0x1a2b33, emissiveIntensity: 0.35 }, C_PLASTER),
     { pos: [p[0], p[1], D / 2 + 0.02], k: 1.06 }));
   house.add(piece(new THREE.BoxGeometry(0.56, 0.52, 0.03),
-    toon(0xfbf6ea), { pos: [p[0], p[1], D / 2 + 0.0], k: 1.035, castShadow: false }));
+    toon(0xfbf6ea, null, C_PLASTER), { pos: [p[0], p[1], D / 2 + 0.0], k: 1.035, castShadow: false }));
 });
 
 // 门口台阶
@@ -652,8 +664,8 @@ scene.add(house);
 
 // ─────────────────────────── 栅栏 ───────────────────────────
 const fence = new THREE.Group();
-const woodMat = toon(0xf2ecdc);
-const railMat = toon(0xeae2cf);
+const woodMat = toon(0xf2ecdc, null, C_WOOD);
+const railMat = toon(0xeae2cf, null, C_WOOD);
 for (let i = 0; i < 13; i++) {
   const x = -3.1 + i * 0.42;
   fence.add(piece(new THREE.BoxGeometry(0.075, 0.56, 0.075),
@@ -733,7 +745,7 @@ hill(66, -44, 20, 8, 0xa9c6ad);
 // ─────────────────────────── 云 ───────────────────────────
 function cloud(x, y, z, s) {
   const g = new THREE.Group();
-  const mat = toon(0xfcfbf6);
+  const mat = toon(0xfcfbf6, null, C_PLASTER);
   [[0, 0, 0, 1.0], [0.85, -0.1, 0.16, 0.74], [-0.82, -0.14, -0.1, 0.68], [0.3, 0.34, -0.2, 0.6], [-0.34, 0.28, 0.14, 0.54]]
     .forEach(function (b) {
       g.add(piece(new THREE.IcosahedronGeometry(b[3], 1), mat,
@@ -901,8 +913,8 @@ bind('s-grain', 'o-grain', 'grain');
 bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.perturb ? v : 0; });
 
 // 肌理格：下拉 + 9 格缩略图（点图直接选）
-const ATLAS_NAMES = ['0 · 壁板（横纹）', '1 · 木纹（竖纹）', '2 · 素纹 A', '3 · 素纹 B',
-                     '4 · 屋瓦（行纹）', '5 · 草地（高频）', '6 · 素纹 C', '7 · 灰泥（最平滑）', '8 · 素纹 D'];
+const ATLAS_NAMES = ['0 · 竖纹木板', '1 · 横向壁板', '2 · 灰泥墙', '3 · 深灰抹灰',
+                     '4 · 屋瓦', '5 · 帆布', '6 · 奶油水粉', '7 · 平滑粉刷', '8 · 绿色笔触'];
 (function () {
   const sel = document.getElementById('s-atlas-cell');
   const oa = document.createElement('option');
@@ -1040,7 +1052,7 @@ window.__lab.atlasInfo = function () {
       return [+m.x.toFixed(3), +m.y.toFixed(3), +m.z.toFixed(3)];
     }),
     k: uPrAtlasK.value,
-    scale: uPrAtlasScale.value
+    scale: P.atlasScale
   };
 };
 window.__lab.patch = function (x, y, w, h) {
