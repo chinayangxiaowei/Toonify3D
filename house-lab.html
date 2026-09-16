@@ -61,7 +61,7 @@
   <div class="row">
     <b>paperroute</b><span class="dim">画风试验台</span>
     <span class="dim">拖拽旋转 · 滚轮缩放 ·</span>
-    <span class="dim"><kbd>R</kbd>复位 <kbd>C</kbd>对比(关扰动) <kbd>P</kbd>纸纹 <kbd>O</kbd>描边</span>
+    <span class="dim"><kbd>R</kbd>复位 <kbd>C</kbd>程序噪声 <kbd>A</kbd>水粉肌理 <kbd>P</kbd>纸纹 <kbd>O</kbd>描边</span>
   </div>
   <div class="row">
     <label class="sl">颜料厚薄 <input id="s-body" type="range" min="0" max="1.20" step="0.01"><output id="o-body"></output></label>
@@ -129,10 +129,11 @@ const P = {
   grain:   0.280,   // 纸纹强度
   grainOn: true,
   atlas:   0.750,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
+  atlasOn: true,    // 水粉肌理图集开关（A 键）：与 C 键的程序噪声层独立，可单开/同开
   atlasScale: 0.55, // 肌理取样尺度（格/世界米）
   atlasCell: -1,    // 手动指定用哪一格（0~8）；-1 = 按材质本色自动分配
   outline: true,
-  perturb: true     // C 键：整体关掉扰动，用来对比
+  perturb: true     // C 键：只关"程序噪声"层（厚薄/抖动/起毛/印痕/勾线），图集不受它管
 };
 // uniform 对象共享 → 拖滑块立刻生效，不用重编译
 const U = {
@@ -474,7 +475,7 @@ function paintAtlasPicker(img) {
     }
     setAtlasCell(P.atlasCell);          // 把格子发给所有材质
     paintAtlasPicker(img);              // 顺手把 9 格画进选择器
-    uPrAtlasK.value = P.perturb ? P.atlas : 0;
+    uPrAtlasK.value = P.atlasOn ? P.atlas : 0;
     needsDraw = true;
   };
   img.onerror = function () { window.__lab.errors.push('gouache-atlas.png 没加载到'); };
@@ -930,7 +931,7 @@ bind('s-high', 'o-high', 'highAmp', function (v) { U.uHighAmp.value = P.perturb 
 bind('s-ink',  'o-ink',  'ink',     function (v) { U.uInk.value     = P.perturb ? v : 0; });
 bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.perturb ? v : 0; });
 bind('s-grain', 'o-grain', 'grain');
-bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.perturb ? v : 0; });
+bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.atlasOn ? v : 0; });
 
 // 肌理格：下拉 + 9 格缩略图（点图直接选）
 const ATLAS_NAMES = ['0 · 竖纹木板', '1 · 横向壁板', '2 · 灰泥墙', '3 · 深灰抹灰',
@@ -972,10 +973,15 @@ function setPerturb(on) {
   U.uHighAmp.value = on ? P.highAmp : 0;
   U.uInk.value     = on ? P.ink : 0;
   U.uOutlineWob.value = on ? P.wobble : 0;
-  uPrAtlasK.value  = on ? P.atlas : 0;
   needsDraw = true;
 }
 function setGrain(on) { P.grainOn = on; needsDraw = true; }
+// 水粉肌理图集：独立开关（A 键），与程序噪声层互不影响
+function setAtlasOn(on) {
+  P.atlasOn = on;
+  uPrAtlasK.value = on ? P.atlas : 0;
+  needsDraw = true;
+}
 
 // ─────────────────────────── 自动配色 ───────────────────────────
 // 思路：不动各个物体的"角色"（草地是绿的、屋顶是红棕的），只把整套颜色
@@ -1028,6 +1034,7 @@ window.addEventListener('keydown', function (e) {
   if (k === 'p') setGrain(!P.grainOn);
   else if (k === 'o') setOutline(!P.outline);
   else if (k === 'c') setPerturb(!P.perturb);
+  else if (k === 'a') setAtlasOn(!P.atlasOn);
   else if (k === 'r') { theta = 0.72; phi = 1.38; radius = 9.2; placeCamera(); }
 });
 
@@ -1062,6 +1069,8 @@ window.__lab.setView = function (t, p, r) {
 };
 window.__lab.setScheme = function (name) { applyScheme(name); return true; };
 window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return true; };
+window.__lab.setPerturb = function (on) { setPerturb(on); return P.perturb; };
+window.__lab.setAtlasOn = function (on) { setAtlasOn(on); return P.atlasOn; };
 window.__lab.tintCount = function () { return tintList.length; };
 window.__lab.setAtlasCell = function (i) { setAtlasCell(i); return P.atlasCell; };
 window.__lab.atlasInfo = function () {
