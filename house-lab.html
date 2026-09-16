@@ -665,7 +665,7 @@ CAT = 'house';
 const W = 2.3, H = 1.5, D = 1.7;   // 墙
 
 house.add(piece(new THREE.BoxGeometry(W, H, D),
-  toon(0xf5e9d2), { pos: [0, H / 2, 0], k: 1.022 }));
+  toon(0xf5e9d2), { pos: [0, H / 2, 0] }));
 
 // 屋顶：三角形截面挤出 → 双坡顶
 (function () {
@@ -674,34 +674,34 @@ house.add(piece(new THREE.BoxGeometry(W, H, D),
   shape.moveTo(-halfW, 0); shape.lineTo(0, rise); shape.lineTo(halfW, 0); shape.lineTo(-halfW, 0);
   const roof = new THREE.ExtrudeGeometry(shape, { depth: depth, bevelEnabled: false });
   roof.translate(0, 0, -depth / 2);
-  house.add(piece(roof, toon(0xb45f4d), { pos: [0, H - 0.02, 0], k: 1.02 }));
+  house.add(piece(roof, toon(0xb45f4d), { pos: [0, H - 0.02, 0] }));
 })();
 
 // 烟囱
 house.add(piece(new THREE.BoxGeometry(0.3, 0.8, 0.3),
-  toon(0xa9664f), { pos: [0.72, H + 0.62, -0.34], k: 1.04 }));
+  toon(0xa9664f), { pos: [0.72, H + 0.62, -0.34] }));
 
 // 门 + 门把手
 CAT = 'trim';
 house.add(piece(new THREE.BoxGeometry(0.52, 0.88, 0.07),
-  toon(0x7c4a3c), { pos: [-0.62, 0.44, D / 2 + 0.02], k: 1.06 }));
+  toon(0x7c4a3c), { pos: [-0.62, 0.44, D / 2 + 0.02] }));
 house.add(piece(new THREE.SphereGeometry(0.035, 8, 6),
-  toon(0xd8c07a), { pos: [-0.44, 0.46, D / 2 + 0.07], k: 1.1, castShadow: false }));
+  toon(0xd8c07a), { pos: [-0.44, 0.46, D / 2 + 0.07], castShadow: false }));
 
 // 两扇窗（玻璃 + 白框）
 [[0.42, 0.92], [1.02, 0.92]].forEach(function (p) {
   house.add(piece(new THREE.BoxGeometry(0.46, 0.42, 0.06),
     toon(0x8fc4dd, { emissive: 0x1a2b33, emissiveIntensity: 0.35 }, C_PLASTER),
-    { pos: [p[0], p[1], D / 2 + 0.02], k: 1.06 }));
+    { pos: [p[0], p[1], D / 2 + 0.02] }));
   house.add(piece(new THREE.BoxGeometry(0.56, 0.52, 0.03),
-    toon(0xfbf6ea, null, C_PLASTER), { pos: [p[0], p[1], D / 2 + 0.0], k: 1.035, castShadow: false }));
+    toon(0xfbf6ea, null, C_PLASTER), { pos: [p[0], p[1], D / 2 + 0.0], castShadow: false }));
 });
 
 // 门口台阶
 house.add(piece(new THREE.BoxGeometry(0.86, 0.12, 0.42),
-  toon(0xc9bfa6), { pos: [-0.62, 0.06, D / 2 + 0.16], k: 1.05 }));
+  toon(0xc9bfa6), { pos: [-0.62, 0.06, D / 2 + 0.16] }));
 house.add(piece(new THREE.BoxGeometry(1.0, 0.1, 0.62),
-  toon(0xbfb49a), { pos: [-0.62, 0.02, D / 2 + 0.26], k: 1.05 }));
+  toon(0xbfb49a), { pos: [-0.62, 0.02, D / 2 + 0.26] }));
 
 house.position.set(-0.5, 0, 0.4);
 house.rotation.y = -0.13;
@@ -715,11 +715,11 @@ const railMat = toon(0xeae2cf, null, C_WOOD);
 for (let i = 0; i < 13; i++) {
   const x = -3.1 + i * 0.42;
   fence.add(piece(new THREE.BoxGeometry(0.075, 0.56, 0.075),
-    woodMat, { pos: [x, 0.3, 0], k: 1.14, castShadow: false }));
+    woodMat, { pos: [x, 0.3, 0], castShadow: false }));
 }
 [0.40, 0.16].forEach(function (y) {
   fence.add(piece(new THREE.BoxGeometry(3.5, 0.07, 0.05),
-    railMat, { pos: [-0.58, y, 0], k: 1.06, castShadow: false }));
+    railMat, { pos: [-0.58, y, 0], castShadow: false }));
 });
 fence.position.set(-0.4, 0, 2.5);
 fence.rotation.y = -0.06;
@@ -728,15 +728,15 @@ scene.add(fence);
 // ─────────────────────────── 邮箱（游戏核心小物） ───────────────────────────
 const mailbox = new THREE.Group();
 mailbox.add(piece(new THREE.BoxGeometry(0.07, 0.72, 0.07),
-  toon(0x8a6a52), { pos: [0, 0.36, 0], k: 1.12 }));
+  toon(0x8a6a52), { pos: [0, 0.36, 0] }));
 mailbox.add(piece(new THREE.BoxGeometry(0.06, 0.34, 0.06),
-  toon(0x8a6a52), { pos: [0, 0.16, 0.16], rot: [0.5, 0, 0], k: 1.14 }));
+  toon(0x8a6a52), { pos: [0, 0.16, 0.16], rot: [0.5, 0, 0] }));
 mailbox.add(piece(new THREE.BoxGeometry(0.26, 0.24, 0.44),
-  toon(0x5f83ab), { pos: [0, 0.82, 0], k: 1.06 }));
+  toon(0x5f83ab), { pos: [0, 0.82, 0] }));
 mailbox.add(piece(new THREE.CylinderGeometry(0.13, 0.13, 0.26, 12, 1, false, 0, Math.PI),
-  toon(0x5f83ab), { pos: [0, 0.94, 0], rot: [0, 0, Math.PI / 2], k: 1.06, castShadow: false }));
+  toon(0x5f83ab), { pos: [0, 0.94, 0], rot: [0, 0, Math.PI / 2], castShadow: false }));
 mailbox.add(piece(new THREE.BoxGeometry(0.03, 0.2, 0.03),
-  toon(0xc4593f), { pos: [0.16, 1.06, 0], k: 1.2, castShadow: false }));
+  toon(0xc4593f), { pos: [0.16, 1.06, 0], castShadow: false }));
 mailbox.position.set(1.85, 0, 2.15);
 mailbox.rotation.y = -0.3;
 scene.add(mailbox);
@@ -746,13 +746,13 @@ function tree(x, z, s, rotY) {
   CAT = 'plant';
   const t = new THREE.Group();
   t.add(piece(new THREE.CylinderGeometry(0.1, 0.15, 1.05, 7),
-    toon(0x6d4b37), { pos: [0, 0.52, 0], k: 1.07 }));
+    toon(0x6d4b37), { pos: [0, 0.52, 0] }));
   const leaf = [0x5c9146, 0x68a04e, 0x548644];
   [[0, 1.62, 0, 0.76], [-0.42, 1.32, 0.16, 0.52], [0.4, 1.38, -0.14, 0.5], [0.05, 2.28, -0.06, 0.42]]
     .forEach(function (b, i) {
       t.add(piece(new THREE.IcosahedronGeometry(b[3], 1),
         toon(leaf[i % leaf.length]),
-        { pos: [b[0], b[1], b[2]], rot: [i * 0.7, i * 1.1, i * 0.4], k: 1.035 }));
+        { pos: [b[0], b[1], b[2]], rot: [i * 0.7, i * 1.1, i * 0.4] }));
     });
   t.position.set(x, 0, z);
   t.rotation.y = rotY;
@@ -767,7 +767,7 @@ tree(-6.2, 2.6, 0.7, 1.2);
 // 灌木
 function bush(x, z, s, color) {
   const b = piece(new THREE.IcosahedronGeometry(0.4, 1), toon(color),
-    { pos: [x, 0.26, z], scale: [1, 0.78, 1], k: 1.05 });
+    { pos: [x, 0.26, z], scale: [1, 0.78, 1] });
   b.scale.multiplyScalar(s);
   scene.add(b);
 }
@@ -797,7 +797,7 @@ function cloud(x, y, z, s) {
   [[0, 0, 0, 1.0], [0.85, -0.1, 0.16, 0.74], [-0.82, -0.14, -0.1, 0.68], [0.3, 0.34, -0.2, 0.6], [-0.34, 0.28, 0.14, 0.54]]
     .forEach(function (b) {
       g.add(piece(new THREE.IcosahedronGeometry(b[3], 1), mat,
-        { pos: [b[0], b[1], b[2]], rot: [b[0], b[1] * 2, b[2]], k: 1.02, castShadow: false, receiveShadow: false }));
+        { pos: [b[0], b[1], b[2]], rot: [b[0], b[1] * 2, b[2]], castShadow: false, receiveShadow: false }));
     });
   g.position.set(x, y, z);
   g.scale.setScalar(s);
