@@ -39,6 +39,9 @@
   label.sl{display:flex;align-items:center;gap:6px;white-space:nowrap;flex:0 0 auto}
   label.sl input[type=range]{width:104px;accent-color:#7a9a5b;height:16px}
   label.sl output{font:11px/1 ui-monospace,monospace;opacity:.7;width:44px;text-align:right}
+  label.cat{display:flex;align-items:center;gap:5px;white-space:nowrap;flex:0 0 auto}
+  label.cat input[type=range]{width:64px;accent-color:#7a9a5b;height:16px}
+  label.cat output{font:11px/1 ui-monospace,monospace;opacity:.7;width:30px;text-align:right}
   label.ck{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
   label.ck input{accent-color:#7a9a5b}
   #hud select, #hud button{font:12px/1.4 inherit;color:var(--ink);
@@ -71,9 +74,18 @@
   </div>
   <div class="row">
     <label class="sl">勾线起毛 <input id="s-wobble" type="range" min="0" max="3" step="0.05"><output id="o-wobble"></output></label>
-    <label class="sl">描边粗细 <input id="s-outlinew" type="range" min="0" max="3" step="0.02"><output id="o-outlinew"></output></label>
+    <label class="sl">描边线宽 <input id="s-outlinepx" type="range" min="0" max="4" step="0.05"><output id="o-outlinepx"></output></label>
     <label class="sl">纸纹 <input id="s-grain" type="range" min="0" max="0.70" step="0.01"><output id="o-grain"></output></label>
     <label class="sl">水粉肌理 <input id="s-atlas" type="range" min="0" max="1.6" step="0.01"><output id="o-atlas"></output></label>
+  </div>
+  <div class="row">
+    <span class="dim">描边分层</span>
+    <label class="cat">房 <input id="s-cat-house" type="range" min="0" max="3" step="0.05"><output id="o-cat-house"></output></label>
+    <label class="cat">饰 <input id="s-cat-trim" type="range" min="0" max="3" step="0.05"><output id="o-cat-trim"></output></label>
+    <label class="cat">物 <input id="s-cat-prop" type="range" min="0" max="3" step="0.05"><output id="o-cat-prop"></output></label>
+    <label class="cat">植 <input id="s-cat-plant" type="range" min="0" max="3" step="0.05"><output id="o-cat-plant"></output></label>
+    <label class="cat">云 <input id="s-cat-cloud" type="range" min="0" max="3" step="0.05"><output id="o-cat-cloud"></output></label>
+    <span class="dim">房=墙/屋顶　饰=门窗台阶　物=栅栏邮箱　植=树/灌木　云=云</span>
   </div>
   <div class="row">
     <label class="sl">配色 <select id="s-scheme"></select></label>
@@ -128,7 +140,8 @@ const P = {
   ink:     0.180,   // 交界处的淡淡压深（画笔印痕 / 颜料堆积）
   wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
   wobbleOn: true,   // 勾线起毛开关（W 键）：独立于 C 键
-  outlineW: 1.00,   // 描边粗细倍率（每件按自己的基准 k 缩放，0 = 不画描边）
+  outlinePx: 1.40,   // 描边线宽（CSS 像素；屏幕等宽：远处按距离补偿加粗）
+  catMul: { house: 1.00, trim: 1.00, prop: 1.00, plant: 1.00, cloud: 1.00 },   // 描边分层：各类别的相对粗细
   grain:   0.280,   // 纸纹强度
   grainOn: true,
   atlas:   0.750,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
@@ -549,10 +562,13 @@ function toon(color, extra, cell) {
 
 const outlineMeshes = [];
 let outlineSeed = 0;
+// 描边类别：每段建模前改一次 CAT，决定这批物件归到哪一类（HUD 里每类的粗细倍率可单独调）
+let CAT = 'prop';
 
 // 勾线起毛：在顶点 shader 里沿法线做噪声位移，让描边粗细不匀、边缘发毛（手绘线的感觉）
 const V_NOISE3 = `
   uniform float uWobble;
+  uniform float uWidth;    // 描边宽度（物体局部单位）：每帧由 JS 按「屏幕等宽」换算
   uniform float uWobFreq;
   uniform float uWobScale;
   uniform vec3  uWobSeed;
@@ -574,18 +590,19 @@ const V_NOISE3 = `
   }
 `;
 
-function makeOutlineMat(radius, k) {
+function makeOutlineMat(radius) {
   const m = new THREE.MeshBasicMaterial({ color: INK, side: THREE.BackSide });
   registerTint(m);
   const r = Math.max(0.05, radius || 0.5);
-  const lineW = r * (Math.max(1.001, k || 1.045) - 1);   // 描边的大致线宽
+  // 线宽不再写死在建件时：每帧由 updateOutlines() 按「目标屏幕宽 × 距离 / 焦距」换算
   const seed = (outlineSeed += 1) * 3.77;
-  m.userData.wobble = { value: Math.max(0.004, lineW * 1.1) };   // 抖动幅度 ≈ 一个线宽
-  m.userData.wob0 = m.userData.wobble.value;                      // 基准抖动幅度（≈ 一个线宽），供粗细倍率缩放
+  m.userData.width  = { value: 0 };   // 描边宽度（物体局部单位），每帧更新
+  m.userData.wobble = { value: 0 };   // 抖动幅度（≈ 一个线宽），每帧更新
   m.userData.wobSeed = { value: new THREE.Vector3(seed * 0.31, seed * 0.57, seed * 0.83) };
   m.userData.wobFreq = { value: 1.0 / (r * 1.1) };
   m.onBeforeCompile = function (shader) {
     shader.uniforms.uWobble   = m.userData.wobble;
+    shader.uniforms.uWidth    = m.userData.width;
     shader.uniforms.uWobSeed  = m.userData.wobSeed;
     shader.uniforms.uWobFreq  = m.userData.wobFreq;
     shader.uniforms.uWobScale = U.uOutlineWob;
@@ -593,13 +610,13 @@ function makeOutlineMat(radius, k) {
       .replace('#include <common>', '#include <common>\n' + V_NOISE3)
       .replace('#include <begin_vertex>', [
         '#include <begin_vertex>',
-        'transformed += normal * ( prNoise3( position * uWobFreq + uWobSeed ) - 0.5 ) * uWobble * uWobScale;'
+        'transformed += normal * ( uWidth + ( prNoise3( position * uWobFreq + uWobSeed ) - 0.5 ) * uWobble * uWobScale );'
       ].join('\n'));
   };
   return m;
 }
 
-// 造一个带描边的物件：几何体要大致居中，描边靠整体 scale 向外长
+// 造一个带描边的物件：描边 = 同一几何体沿法线外推固定宽度（线宽处处一致，几何体也不必居中）
 function piece(geo, mat, opt) {
   opt = opt || {};
   const g = new THREE.Group();
@@ -609,11 +626,11 @@ function piece(geo, mat, opt) {
   g.add(mesh);
   if (opt.outline !== false) {
     if (!geo.boundingSphere) geo.computeBoundingSphere();
-    const om = new THREE.Mesh(geo, makeOutlineMat(geo.boundingSphere.radius, opt.k || 1.045));
-    om.scale.setScalar(opt.k || 1.045);
-    om.userData.baseK = (opt.k || 1.045);   // 记下基准粗细，供描边粗细滑杆缩放
+    const om = new THREE.Mesh(geo, makeOutlineMat(geo.boundingSphere.radius));
+    om.userData.rGeo = geo.boundingSphere.radius;   // 半径：算「屏幕等宽」时要用
+    om.userData.cat  = opt.cat || CAT;              // 类别：HUD 里每类一个粗细倍率
     om.castShadow = false; om.receiveShadow = false;
-    om.visible = P.outline;
+    om.visible = false;   // 先关着，等 updateOutlines() 算好宽度再亮
     outlineMeshes.push(om);
     g.add(om);
   }
@@ -644,6 +661,7 @@ scene.add(grass);
 
 // ─────────────────────────── 房子 ───────────────────────────
 const house = new THREE.Group();
+CAT = 'house';
 const W = 2.3, H = 1.5, D = 1.7;   // 墙
 
 house.add(piece(new THREE.BoxGeometry(W, H, D),
@@ -664,6 +682,7 @@ house.add(piece(new THREE.BoxGeometry(0.3, 0.8, 0.3),
   toon(0xa9664f), { pos: [0.72, H + 0.62, -0.34], k: 1.04 }));
 
 // 门 + 门把手
+CAT = 'trim';
 house.add(piece(new THREE.BoxGeometry(0.52, 0.88, 0.07),
   toon(0x7c4a3c), { pos: [-0.62, 0.44, D / 2 + 0.02], k: 1.06 }));
 house.add(piece(new THREE.SphereGeometry(0.035, 8, 6),
@@ -690,6 +709,7 @@ scene.add(house);
 
 // ─────────────────────────── 栅栏 ───────────────────────────
 const fence = new THREE.Group();
+CAT = 'prop';
 const woodMat = toon(0xf2ecdc, null, C_WOOD);
 const railMat = toon(0xeae2cf, null, C_WOOD);
 for (let i = 0; i < 13; i++) {
@@ -723,6 +743,7 @@ scene.add(mailbox);
 
 // ─────────────────────────── 树 ───────────────────────────
 function tree(x, z, s, rotY) {
+  CAT = 'plant';
   const t = new THREE.Group();
   t.add(piece(new THREE.CylinderGeometry(0.1, 0.15, 1.05, 7),
     toon(0x6d4b37), { pos: [0, 0.52, 0], k: 1.07 }));
@@ -770,6 +791,7 @@ hill(66, -44, 20, 8, 0xa9c6ad);
 
 // ─────────────────────────── 云 ───────────────────────────
 function cloud(x, y, z, s) {
+  CAT = 'cloud';
   const g = new THREE.Group();
   const mat = toon(0xfcfbf6, null, C_PLASTER);
   [[0, 0, 0, 1.0], [0.85, -0.1, 0.16, 0.74], [-0.82, -0.14, -0.1, 0.68], [0.3, 0.34, -0.2, 0.6], [-0.34, 0.28, 0.14, 0.54]]
@@ -798,6 +820,7 @@ function placeCamera() {
     target.z + radius * Math.sin(phi) * Math.cos(theta)
   );
   camera.lookAt(target);
+  updateOutlines();
   needsDraw = true;
 }
 placeCamera();
@@ -872,6 +895,7 @@ function resize() {
   paper.style.width = w + 'px'; paper.style.height = h + 'px';
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  updateOutlines();
   needsDraw = true;
 }
 window.addEventListener('resize', resize);
@@ -935,7 +959,18 @@ bind('s-low',  'o-low',  'lowAmp',  function (v) { U.uLowAmp.value  = P.perturb 
 bind('s-high', 'o-high', 'highAmp', function (v) { U.uHighAmp.value = P.perturb ? v : 0; });
 bind('s-ink',  'o-ink',  'ink',     function (v) { U.uInk.value     = P.perturb ? v : 0; });
 bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.wobbleOn ? v : 0; });
-bind('s-outlinew', 'o-outlinew', 'outlineW', function (v) { setOutlineW(v); });
+bind('s-outlinepx', 'o-outlinepx', 'outlinePx', function () { updateOutlines(); });
+Object.keys(P.catMul).forEach(function (c) {
+  const el = document.getElementById('s-cat-' + c), out = document.getElementById('o-cat-' + c);
+  if (!el) return;
+  el.value = String(P.catMul[c]);
+  out.textContent = P.catMul[c].toFixed(2);
+  el.addEventListener('input', function () {
+    P.catMul[c] = parseFloat(el.value);
+    out.textContent = P.catMul[c].toFixed(2);
+    updateOutlines();
+  });
+});
 bind('s-grain', 'o-grain', 'grain');
 bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.atlasOn ? v : 0; });
 
@@ -969,7 +1004,7 @@ const ATLAS_NAMES = ['0 · 竖纹木板', '1 · 横向壁板', '2 · 灰泥墙',
 
 function setOutline(on) {
   P.outline = on;
-  outlineMeshes.forEach(function (m) { m.visible = on && P.outlineW > 0.001; });
+  updateOutlines();   // 粗细与可见性都由它算（按屏幕像素宽 × 每类倍率）
   needsDraw = true;
 }
 function setPerturb(on) {
@@ -981,16 +1016,27 @@ function setPerturb(on) {
   needsDraw = true;
 }
 function setGrain(on) { P.grainOn = on; needsDraw = true; }
-// 描边粗细：把每条描边相对自己的基准 k 做统一倍率缩放（0 = 不画；抖动幅度跟着线宽一起缩放）
-function setOutlineW(mult) {
-  P.outlineW = mult;
+// 描边宽度：目标屏幕线宽（CSS px）→ 世界宽（按距离补偿）→ 物体局部宽（除累积缩放）
+//   rim_px = worldW / dist × 焦距  ⇒  worldW = px × dist / 焦距
+// 距离补偿：屏幕上线宽大致恒定（手绘勾线不会近粗远细）
+function updateOutlines() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const focal = (paper.height / 2) / Math.tan((camera.fov * Math.PI / 180) / 2);   // 设备像素
+  const pos = new THREE.Vector3(), scl = new THREE.Vector3();   // 每次新建：placeCamera 的执行早于本函数定义，模块级 const 会踩 TDZ
   outlineMeshes.forEach(function (om) {
-    om.scale.setScalar(1 + (om.userData.baseK - 1) * Math.max(0, mult));
-    om.material.userData.wobble.value = Math.max(0.0008, om.material.userData.wob0 * mult);
-    om.visible = P.outline && mult > 0.001;   // 倍率 0 时两层会重合闪 z-fighting，干脆不画
+    const px = P.outlinePx * dpr * (P.catMul[om.userData.cat] || 1);       // 目标：设备像素
+    om.parent.getWorldPosition(pos);
+    om.parent.getWorldScale(scl);
+    const sc = Math.max(0.0001, Math.max(Math.abs(scl.x), Math.abs(scl.y), Math.abs(scl.z)));
+    const wObj = (px * camera.position.distanceTo(pos) / focal) / sc;      // 物体局部单位
+    om.material.userData.width.value  = wObj;
+    om.material.userData.wobble.value = wObj * 1.1;                        // 起毛幅度 ≈ 一个线宽
+    om.visible = P.outline && px > 0.05;
   });
   needsDraw = true;
 }
+function setOutlinePx(px) { P.outlinePx = px; updateOutlines(); }
+function setCatMul(cat, m) { P.catMul[cat] = m; updateOutlines(); }
 // 水粉肌理图集：独立开关（A 键），与程序噪声层互不影响
 function setAtlasOn(on) {
   P.atlasOn = on;
@@ -1063,11 +1109,11 @@ window.addEventListener('keydown', function (e) {
 // ─────────────────────────── 调试口（给 agent 采样用） ───────────────────────────
 window.__lab.setParam = function (k, v) {
   P[k] = v;
-  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain', atlas: 'atlas', outlineW: 'outlinew' }[k]);
+  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain', atlas: 'atlas', outlinePx: 'outlinepx' }[k]);
   if (el) { el.value = String(v); }
   if (k === 'bodyAmp') U.uBodyAmp.value = v;
   if (k === 'wobble') U.uOutlineWob.value = v;
-  if (k === 'outlineW') setOutlineW(v);
+  if (k === 'outlinePx') updateOutlines();
   if (k === 'lowAmp') U.uLowAmp.value = v;
   if (k === 'highAmp') U.uHighAmp.value = v;
   if (k === 'ink') U.uInk.value = v;
@@ -1095,7 +1141,9 @@ window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return tru
 window.__lab.setPerturb = function (on) { setPerturb(on); return P.perturb; };
 window.__lab.setAtlasOn = function (on) { setAtlasOn(on); return P.atlasOn; };
 window.__lab.setWobbleOn = function (on) { setWobbleOn(on); return P.wobbleOn; };
-window.__lab.setOutlineW = function (v) { setOutlineW(v); return P.outlineW; };
+window.__lab.setOutlinePx = function (v) { setOutlinePx(v); return P.outlinePx; };
+window.__lab.setCatMul = function (c, m) { setCatMul(c, m); return P.catMul[c]; };
+window.__lab.updateOutlines = updateOutlines;
 window.__lab.tintCount = function () { return tintList.length; };
 window.__lab.setAtlasCell = function (i) { setAtlasCell(i); return P.atlasCell; };
 window.__lab.atlasInfo = function () {
