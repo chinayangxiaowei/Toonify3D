@@ -243,6 +243,7 @@ const GRADIENT_PARS = `
   uniform float uInk;
 
   varying vec3  vPrPos;    // 世界坐标：噪声钉在世界/物体上，相机转动/缩放时纹理跟着物体走
+  varying vec3  vPrNormal; // 世界法线：盒式投影必须用它（vNormal 是视图空间的，相机会带着纹理跑）
   varying float vPrDist;   // 到相机的距离：远处把高频淡出，免得亚像素闪烁
   float gPrThick = 0.5;    // 浓淡权重（0=薄透，1=浓重）；由 getGradientIrradiance 写入，main 里读
 
@@ -348,7 +349,7 @@ const GRADIENT_PARS = `
 const ATLAS_MIX = `
   #include <map_fragment>
   if ( uPrAtlasK > 0.001 ) {
-    vec3 an = abs( vNormal );                       // 按法线主轴选投影面
+    vec3 an = abs( normalize( vPrNormal ) );                       // 按【世界】法线主轴选投影面（vNormal 是视图空间的，相机会带着纹理跑）
     vec2 auv;
     if ( an.x >= an.y && an.x >= an.z )      auv = vec2( vPrPos.z, vPrPos.y );
     else if ( an.y >= an.z )                 auv = vec2( vPrPos.x, vPrPos.z );
@@ -526,11 +527,12 @@ function toon(color, extra, cell) {
     shader.uniforms.uPrAtlasK     = uPrAtlasK;
     shader.uniforms.uPrAtlasScale = slot.scale;
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vPrPos;\nvarying float vPrDist;')
+      .replace('#include <common>', '#include <common>\nvarying vec3 vPrPos;\nvarying vec3 vPrNormal;\nvarying float vPrDist;')
       .replace('#include <begin_vertex>', [
         '#include <begin_vertex>',
         'vec4 prWorld = modelMatrix * vec4( transformed, 1.0 );',
         'vPrPos  = prWorld.xyz;',
+        'vPrNormal = normalize( mat3( modelMatrix ) * normal );',
         'vPrDist = -( viewMatrix * prWorld ).z;'
       ].join('\n'));
     shader.fragmentShader = shader.fragmentShader
@@ -1100,7 +1102,3 @@ window.__lab.ready = true;
 </script>
 </body>
 </html>
-cript>
-</body>
-</html>
-l>
