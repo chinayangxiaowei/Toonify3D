@@ -71,6 +71,7 @@
   </div>
   <div class="row">
     <label class="sl">勾线起毛 <input id="s-wobble" type="range" min="0" max="3" step="0.05"><output id="o-wobble"></output></label>
+    <label class="sl">描边粗细 <input id="s-outlinew" type="range" min="0" max="3" step="0.02"><output id="o-outlinew"></output></label>
     <label class="sl">纸纹 <input id="s-grain" type="range" min="0" max="0.70" step="0.01"><output id="o-grain"></output></label>
     <label class="sl">水粉肌理 <input id="s-atlas" type="range" min="0" max="1.6" step="0.01"><output id="o-atlas"></output></label>
   </div>
@@ -127,6 +128,7 @@ const P = {
   ink:     0.180,   // 交界处的淡淡压深（画笔印痕 / 颜料堆积）
   wobble:  1.000,   // 勾线起毛：描边沿法线噪声抖动（0 = 干净等宽线）
   wobbleOn: true,   // 勾线起毛开关（W 键）：独立于 C 键
+  outlineW: 1.00,   // 描边粗细倍率（每件按自己的基准 k 缩放，0 = 不画描边）
   grain:   0.280,   // 纸纹强度
   grainOn: true,
   atlas:   0.750,   // 手绘水粉肌理强度（乘进漫反射；图集是中性灰白 → 只加厚薄、不带异色）
@@ -579,6 +581,7 @@ function makeOutlineMat(radius, k) {
   const lineW = r * (Math.max(1.001, k || 1.045) - 1);   // 描边的大致线宽
   const seed = (outlineSeed += 1) * 3.77;
   m.userData.wobble = { value: Math.max(0.004, lineW * 1.1) };   // 抖动幅度 ≈ 一个线宽
+  m.userData.wob0 = m.userData.wobble.value;                      // 基准抖动幅度（≈ 一个线宽），供粗细倍率缩放
   m.userData.wobSeed = { value: new THREE.Vector3(seed * 0.31, seed * 0.57, seed * 0.83) };
   m.userData.wobFreq = { value: 1.0 / (r * 1.1) };
   m.onBeforeCompile = function (shader) {
@@ -608,6 +611,7 @@ function piece(geo, mat, opt) {
     if (!geo.boundingSphere) geo.computeBoundingSphere();
     const om = new THREE.Mesh(geo, makeOutlineMat(geo.boundingSphere.radius, opt.k || 1.045));
     om.scale.setScalar(opt.k || 1.045);
+    om.userData.baseK = (opt.k || 1.045);   // 记下基准粗细，供描边粗细滑杆缩放
     om.castShadow = false; om.receiveShadow = false;
     om.visible = P.outline;
     outlineMeshes.push(om);
@@ -931,6 +935,7 @@ bind('s-low',  'o-low',  'lowAmp',  function (v) { U.uLowAmp.value  = P.perturb 
 bind('s-high', 'o-high', 'highAmp', function (v) { U.uHighAmp.value = P.perturb ? v : 0; });
 bind('s-ink',  'o-ink',  'ink',     function (v) { U.uInk.value     = P.perturb ? v : 0; });
 bind('s-wobble', 'o-wobble', 'wobble', function (v) { U.uOutlineWob.value = P.wobbleOn ? v : 0; });
+bind('s-outlinew', 'o-outlinew', 'outlineW', function (v) { setOutlineW(v); });
 bind('s-grain', 'o-grain', 'grain');
 bind('s-atlas', 'o-atlas', 'atlas', function (v) { uPrAtlasK.value = P.atlasOn ? v : 0; });
 
@@ -964,7 +969,7 @@ const ATLAS_NAMES = ['0 · 竖纹木板', '1 · 横向壁板', '2 · 灰泥墙',
 
 function setOutline(on) {
   P.outline = on;
-  outlineMeshes.forEach(function (m) { m.visible = on; });
+  outlineMeshes.forEach(function (m) { m.visible = on && P.outlineW > 0.001; });
   needsDraw = true;
 }
 function setPerturb(on) {
@@ -976,6 +981,16 @@ function setPerturb(on) {
   needsDraw = true;
 }
 function setGrain(on) { P.grainOn = on; needsDraw = true; }
+// 描边粗细：把每条描边相对自己的基准 k 做统一倍率缩放（0 = 不画；抖动幅度跟着线宽一起缩放）
+function setOutlineW(mult) {
+  P.outlineW = mult;
+  outlineMeshes.forEach(function (om) {
+    om.scale.setScalar(1 + (om.userData.baseK - 1) * Math.max(0, mult));
+    om.material.userData.wobble.value = Math.max(0.0008, om.material.userData.wob0 * mult);
+    om.visible = P.outline && mult > 0.001;   // 倍率 0 时两层会重合闪 z-fighting，干脆不画
+  });
+  needsDraw = true;
+}
 // 水粉肌理图集：独立开关（A 键），与程序噪声层互不影响
 function setAtlasOn(on) {
   P.atlasOn = on;
@@ -1048,10 +1063,11 @@ window.addEventListener('keydown', function (e) {
 // ─────────────────────────── 调试口（给 agent 采样用） ───────────────────────────
 window.__lab.setParam = function (k, v) {
   P[k] = v;
-  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain', atlas: 'atlas' }[k]);
+  const el = document.getElementById('s-' + { bodyAmp: 'body', lowAmp: 'low', highAmp: 'high', ink: 'ink', wobble: 'wobble', grain: 'grain', atlas: 'atlas', outlineW: 'outlinew' }[k]);
   if (el) { el.value = String(v); }
   if (k === 'bodyAmp') U.uBodyAmp.value = v;
   if (k === 'wobble') U.uOutlineWob.value = v;
+  if (k === 'outlineW') setOutlineW(v);
   if (k === 'lowAmp') U.uLowAmp.value = v;
   if (k === 'highAmp') U.uHighAmp.value = v;
   if (k === 'ink') U.uInk.value = v;
@@ -1079,6 +1095,7 @@ window.__lab.setTint = function (hs, sm, lm) { applyTint(hs, sm, lm); return tru
 window.__lab.setPerturb = function (on) { setPerturb(on); return P.perturb; };
 window.__lab.setAtlasOn = function (on) { setAtlasOn(on); return P.atlasOn; };
 window.__lab.setWobbleOn = function (on) { setWobbleOn(on); return P.wobbleOn; };
+window.__lab.setOutlineW = function (v) { setOutlineW(v); return P.outlineW; };
 window.__lab.tintCount = function () { return tintList.length; };
 window.__lab.setAtlasCell = function (i) { setAtlasCell(i); return P.atlasCell; };
 window.__lab.atlasInfo = function () {
